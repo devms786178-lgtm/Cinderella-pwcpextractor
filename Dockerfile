@@ -1,7 +1,10 @@
-FROM python:3.12.1
-RUN pip install --upgrade pip
-COPY requirements.txt requirements.txt
-WORKDIR .
+FROM python:3.10-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
 COPY . .
-RUN pip3 install -r requirements.txt
-CMD ["python3", "main.py"]
+
+CMD ["python", "main.py"]

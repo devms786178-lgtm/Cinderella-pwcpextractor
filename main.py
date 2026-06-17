@@ -13,7 +13,6 @@ import base64
 from pyrogram import Client, filters
 import sys
 import re
-import requests
 import uuid
 import random
 import string
@@ -35,19 +34,21 @@ from config import api_id, api_hash, bot_token, auth_users
 from datetime import datetime
 import time
 from concurrent.futures import ThreadPoolExecutor
+
+# ThreadPool for running async functions in separate threads
 THREADPOOL = ThreadPoolExecutor(max_workers=1000)
+
 import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Bot credentials from environment variables (Render compatible)
-API_ID = int(os.environ.get("API_ID",  38498066))
+API_ID = int(os.environ.get("API_ID", 38498066))
 API_HASH = os.environ.get("API_HASH", "c9696114751feacdeb1b4487f5839a1a")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
-# Initialize Bot Globally (IMPORTANT FIX)
+# Initialize Bot Globally
 bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-        
 # Flask app for Render
 app = Flask(__name__)
 
@@ -56,49 +57,128 @@ def home():
     return "Bot is running!"
 
 def run_flask():
-    app.run(host="0.0.0.0", port=8000) # Use here 8080 port,if you are deploying it on koyeb
-    
+    app.run(host="0.0.0.0", port=8000)
+
 image_list = [
-"https://graph.org/file/d24b9bd4d0592a07ad746-de047531c5efafafce.jpg",
-"https://graph.org/file/06d5077e2fe5442e1dbb4-77cb51eecc0aab0608.jpg",
-"https://graph.org/file/8ea482ae6278601bae5c5-b1475ac9b0622a6cd7.jpg",
-"https://graph.org/file/5312e32455e56860c75cb-b56bedb77b7cf93227.jpg",
-"https://graph.org/file/977afb0f88089d227a19d-443ba34add7d83a182.jpg",
+    "https://graph.org/file/d24b9bd4d0592a07ad746-de047531c5efafafce.jpg",
+    "https://graph.org/file/06d5077e2fe5442e1dbb4-77cb51eecc0aab0608.jpg",
+    "https://graph.org/file/8ea482ae6278601bae5c5-b1475ac9b0622a6cd7.jpg",
+    "https://graph.org/file/5312e32455e56860c75cb-b56bedb77b7cf93227.jpg",
+    "https://graph.org/file/977afb0f88089d227a19d-443ba34add7d83a182.jpg",
 ]
 print(4321)
-#bot = Client(
-    #"bot",
-    #api_id=25051520,
-    #api_hash=91c0e86e56bb2f711454d86779091033,
-    #bot_token=8118302536:AAGOyYKO0FFVR7HuE3IO2ZMj8xB_Z56lhqs)
 
-@bot.on_message(filters.command(["start"]))
-async def start(bot, message):
-  random_image_url = random.choice(image_list)
 
-  keyboard = [ 
-      [InlineKeyboardButton("🚀 Physics Wallah without Purchase 🚀", callback_data="pwwp")],
-      [InlineKeyboardButton("🚀 Classplus without Purchase 🚀", callback_data="cpwp")]
- ]
-  
+# ═══════════════════════════════════════════════════════════════
+# UTILITY: Extract video URL from various PW API response formats
+# ═══════════════════════════════════════════════════════════════
+def extract_video_url(video_details: dict) -> Tuple[str, str]:
+    """
+    Extract video URL and DRM keys from PW videoDetails.
+    Returns: (video_url, drm_info_string)
+    drm_info_string format: " | DRM: ClearKey | --key KID:KEY" or empty string
+    """
+    if not video_details:
+        return "", ""
 
-  reply_markup = InlineKeyboardMarkup(keyboard)
+    video_url = ""
+    drm_info = ""
 
-  await message.reply_photo(
-    photo=random_image_url,
-    caption="PLEASE👇PRESS👇HERE",
-    quote=True,
-    reply_markup=reply_markup
-  )
-  
-@bot.on_message(group=2)
-#async def account_login(bot: Client, m: Message):
-#    try:
-#        await bot.forward_messages(chat_id=chat_id, from_chat_id=m.chat.id, message_ids=m.id)
-#    except:
-#        pass
+    # 1. Try direct videoUrl field
+    if video_details.get('videoUrl'):
+        video_url = video_details['videoUrl']
 
-# Pw Function 
+    # 2. Try videoMapping (most common for newer PW videos)
+    video_mapping = video_details.get('videoMapping', {})
+    if not video_url and video_mapping:
+        # Try various CDN mappings
+        if video_mapping.get('mux'):
+            mux = video_mapping['mux']
+            if isinstance(mux, dict):
+                video_url = mux.get('url') or mux.get('playbackId', '')
+                if video_url and not video_url.startswith('http'):
+                    video_url = f"https://stream.mux.com/{video_url}.m3u8"
+            elif isinstance(mux, str):
+                video_url = mux
+        if not video_url and video_mapping.get('alisg-cdn'):
+            cdn = video_mapping['alisg-cdn']
+            if isinstance(cdn, dict):
+                video_url = cdn.get('url') or cdn.get('videoUrl', '')
+            elif isinstance(cdn, str):
+                video_url = cdn
+        if not video_url and video_mapping.get('cdn'):
+            cdn = video_mapping['cdn']
+            if isinstance(cdn, dict):
+                video_url = cdn.get('url') or cdn.get('videoUrl', '')
+            elif isinstance(cdn, str):
+                video_url = cdn
+        # Generic: iterate all mapping keys
+        if not video_url:
+            for key, val in video_mapping.items():
+                if isinstance(val, dict):
+                    for sub_key in ['url', 'videoUrl', 'playbackId', 'mpdUrl', 'm3u8Url', 'dashUrl', 'hlsUrl']:
+                        if val.get(sub_key):
+                            video_url = val[sub_key]
+                            break
+                elif isinstance(val, str) and val.startswith('http'):
+                    video_url = val
+                if video_url:
+                    break
+
+    # 3. Try embedCode (extract iframe src)
+    if not video_url and video_details.get('embedCode'):
+        embed = video_details['embedCode']
+        src_match = re.search(r'src=["\'](.*?)["\']', embed)
+        if src_match:
+            video_url = src_match.group(1)
+
+    # 4. Try various other fields
+    if not video_url:
+        for key in ['url', 'playbackUrl', 'streamUrl', 'dashUrl', 'hlsUrl', 'mpdUrl', 'm3u8Url', 'cdnUrl']:
+            if video_details.get(key):
+                video_url = video_details[key]
+                break
+
+    # ═══════════════════════════════════════════════════════════════
+    # DRM / ClearKey Extraction
+    # ═══════════════════════════════════════════════════════════════
+    drm_details = video_details.get('drmDetails') or video_details.get('drm') or {}
+    if drm_details:
+        drm_type = drm_details.get('drmType', '') or drm_details.get('type', '')
+        if drm_type and str(drm_type).lower() == 'clearkey':
+            keys_list = []
+            # Try various key formats
+            if drm_details.get('keys'):
+                keys_list = drm_details['keys']
+            elif drm_details.get('key_strings'):
+                keys_list = drm_details['key_strings']
+            elif drm_details.get('keyId') and drm_details.get('key'):
+                keys_list = [f"{drm_details['keyId']}:{drm_details['key']}"]
+            elif drm_details.get('kid') and drm_details.get('key'):
+                keys_list = [f"{drm_details['kid']}:{drm_details['key']}"]
+
+            if keys_list:
+                # Format keys nicely
+                formatted_keys = []
+                for k in keys_list:
+                    if isinstance(k, str):
+                        if k.startswith('--key'):
+                            formatted_keys.append(k.replace('--key ', ''))
+                        else:
+                            formatted_keys.append(k)
+                drm_key_str = ' | '.join(formatted_keys)
+                drm_info = f" | DRM: ClearKey | Key: {drm_key_str}"
+
+    # If video_url contains .mpd or .m3u8 but no protocol, add https
+    if video_url and not video_url.startswith('http'):
+        video_url = f"https:{video_url}"
+
+    return video_url, drm_info
+
+
+# ═══════════════════════════════════════════════════════════════
+# PW API FETCH (with proper retry logic)
+# ═══════════════════════════════════════════════════════════════
 async def fetch_pwwp_data(session: aiohttp.ClientSession, url: str, headers: Dict = None, params: Dict = None, data: Dict = None, method: str = 'GET') -> Any:
     max_retries = 3
     for attempt in range(max_retries):
@@ -112,12 +192,15 @@ async def fetch_pwwp_data(session: aiohttp.ClientSession, url: str, headers: Dic
             logging.exception(f"Attempt {attempt + 1} failed: Unexpected error fetching {url}: {e}")
 
         if attempt < max_retries - 1:
-            await asyncio.sleep(90 ** attempt)
+            await asyncio.sleep(2 ** attempt)
         else:
             logging.error(f"Failed to fetch {url} after {max_retries} attempts.")
             return None
 
 
+# ═══════════════════════════════════════════════════════════════
+# PW: Process chapter content (videos + notes + DPP)
+# ═══════════════════════════════════════════════════════════════
 async def process_pwwp_chapter_content(session: aiohttp.ClientSession, chapter_id, selected_batch_id, subject_id, schedule_id, content_type, headers: Dict):
     url = f"https://api.penpencil.co/v1/batches/{selected_batch_id}/subject/{subject_id}/schedule/{schedule_id}/schedule-details"
     data = await fetch_pwwp_data(session, url, headers=headers)
@@ -126,18 +209,19 @@ async def process_pwwp_chapter_content(session: aiohttp.ClientSession, chapter_i
     if data and data.get("success") and data.get("data"):
         data_item = data["data"]
 
+        # ─── VIDEOS ───
         if content_type in ("videos", "DppVideos"):
             video_details = data_item.get('videoDetails', {})
             if video_details:
                 name = data_item.get('topic', '')
-                videoUrl = video_details.get('videoUrl') or video_details.get('embedCode') or ""
-            #    image = video_details.get('image', "")
+                video_url, drm_info = extract_video_url(video_details)
 
-                if videoUrl:
-                    line = f"{name}:{videoUrl}"
+                if video_url:
+                    # Include DRM keys with the URL
+                    line = f"{name}:{video_url}{drm_info}"
                     content.append(line)
-               #     logging.info(line)
 
+        # ─── NOTES (PDFs) ───
         elif content_type in ("notes", "DppNotes"):
             homework_ids = data_item.get('homeworkIds', [])
             for homework in homework_ids:
@@ -148,11 +232,10 @@ async def process_pwwp_chapter_content(session: aiohttp.ClientSession, chapter_i
                     if url:
                         line = f"{name}:{url}"
                         content.append(line)
-                    #    logging.info(line)
 
         return {content_type: content} if content else {}
     else:
-        logging.warning(f"No Data Found For  Id - {schedule_id}")
+        logging.warning(f"No Data Found For Id - {schedule_id}")
         return {}
 
 
@@ -254,8 +337,8 @@ async def process_pwwp_subject(session: aiohttp.ClientSession, subject: Dict, se
                 all_urls.extend(content)
     all_subject_urls[subject_name] = all_urls
 
-def find_pw_old_batch(batch_search):
 
+def find_pw_old_batch(batch_search):
     try:
         response = requests.get(f"https://abhiguru143.github.io/AS-MULTIVERSE-PW/batch/batch.json")
         response.raise_for_status()
@@ -274,8 +357,11 @@ def find_pw_old_batch(batch_search):
 
     return matching_batches
 
-async def get_pwwp_todays_schedule_content_details(session: aiohttp.ClientSession, selected_batch_id, subject_id, schedule_id, headers: Dict) -> List[str]:
 
+# ═══════════════════════════════════════════════════════════════
+# PW: Today's Schedule Content (FIXED - with video DRM support)
+# ═══════════════════════════════════════════════════════════════
+async def get_pwwp_todays_schedule_content_details(session: aiohttp.ClientSession, selected_batch_id, subject_id, schedule_id, headers: Dict) -> List[str]:
     url = f"https://api.penpencil.co/v1/batches/{selected_batch_id}/subject/{subject_id}/schedule/{schedule_id}/schedule-details"
     data = await fetch_pwwp_data(session, url, headers)
     content = []
@@ -283,52 +369,45 @@ async def get_pwwp_todays_schedule_content_details(session: aiohttp.ClientSessio
     if data and data.get("success") and data.get("data"):
         data_item = data["data"]
         
+        # ─── VIDEO EXTRACTION (with ClearKey DRM) ───
         video_details = data_item.get('videoDetails', {})
         if video_details:
-            name = data_item.get('topic')
-            
-            videoUrl = video_details.get('videoUrl') or video_details.get('embedCode')
-            image = video_details.get('image')
+            name = data_item.get('topic', '')
+            video_url, drm_info = extract_video_url(video_details)
                 
-            if videoUrl:
-                line = f"{name}:{videoUrl}\n"
+            if video_url:
+                line = f"{name}:{video_url}{drm_info}\n"
                 content.append(line)
-           #     logging.info(line)
                
-                          
-        homework_ids = data_item.get('homeworkIds')
+        # ─── HOMEWORK / NOTES (PDFs) ───          
+        homework_ids = data_item.get('homeworkIds', [])
         for homework in homework_ids:
-            attachment_ids = homework.get('attachmentIds')
-            name = homework.get('topic')
+            attachment_ids = homework.get('attachmentIds', [])
+            name = homework.get('topic', '')
             for attachment in attachment_ids:
-            
                 url = attachment.get('baseUrl', '') + attachment.get('key', '')
-                        
                 if url:
                     line = f"{name}:{url}\n"
                     content.append(line)
-                #    logging.info(line)
                 
+        # ─── DPP HOMEWORK ───
         dpp = data_item.get('dpp')
         if dpp:
-            dpp_homework_ids = dpp.get('homeworkIds')
+            dpp_homework_ids = dpp.get('homeworkIds', [])
             for homework in dpp_homework_ids:
-                attachment_ids = homework.get('attachmentIds')
-                name = homework.get('topic')
+                attachment_ids = homework.get('attachmentIds', [])
+                name = homework.get('topic', '')
                 for attachment in attachment_ids:
-                
                     url = attachment.get('baseUrl', '') + attachment.get('key', '')
-                        
                     if url:
                         line = f"{name}:{url}\n"
                         content.append(line)
-                    #    logging.info(line)
     else:
-        logging.warning(f"No Data Found For  Id - {schedule_id}")
+        logging.warning(f"No Data Found For Id - {schedule_id}")
     return content
     
-async def get_pwwp_all_todays_schedule_content(session: aiohttp.ClientSession, selected_batch_id: str, headers: Dict) -> List[str]:
 
+async def get_pwwp_all_todays_schedule_content(session: aiohttp.ClientSession, selected_batch_id: str, headers: Dict) -> List[str]:
     url = f"https://api.penpencil.co/v1/batches/{selected_batch_id}/todays-schedule"
     todays_schedule_details = await fetch_pwwp_data(session, url, headers)
     all_content = []
@@ -352,21 +431,56 @@ async def get_pwwp_all_todays_schedule_content(session: aiohttp.ClientSession, s
         logging.warning("No today's schedule data found.")
 
     return all_content
-    
+
+
+# ═══════════════════════════════════════════════════════════════
+# BOT: Start Command
+# ═══════════════════════════════════════════════════════════════
+@bot.on_message(filters.command(["start"]))
+async def start(bot, message):
+    random_image_url = random.choice(image_list)
+
+    keyboard = [ 
+        [InlineKeyboardButton(" Physics Wallah without Purchase ", callback_data="pwwp")],
+        [InlineKeyboardButton(" Classplus without Purchase ", callback_data="cpwp")]
+    ]
+  
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await message.reply_photo(
+        photo=random_image_url,
+        caption="PLEASE PRESS HERE",
+        quote=True,
+        reply_markup=reply_markup
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+# BOT: PW Callback Handler (FIXED ThreadPool)
+# ═══════════════════════════════════════════════════════════════
+def _run_async_in_thread(coro):
+    """Helper to run async coroutine in ThreadPool"""
+    asyncio.run(coro)
+
 @bot.on_callback_query(filters.regex("^pwwp$"))
 async def pwwp_callback(bot, callback_query):
     user_id = callback_query.from_user.id
     await callback_query.answer()
     
     if user_id not in auth_users:
-        await bot.send_message(callback_query.message.chat.id, f"**You Are Not Subscribed To This Bot DM for access @A_S_9162**")
+        await bot.send_message(callback_query.message.chat.id, "**You Are Not Subscribed To This Bot DM for access @A_S_9162**")
         return
         
-    THREADPOOL.submit(asyncio.run, process_pwwp(bot, callback_query.message, user_id))
+    # FIXED: Properly wrap async function for ThreadPool
+    THREADPOOL.submit(_run_async_in_thread, process_pwwp(bot, callback_query.message, user_id))
 
+
+# ═══════════════════════════════════════════════════════════════
+# PW: Main Processing Function (Full Batch + Today's Class)
+# ═══════════════════════════════════════════════════════════════
 async def process_pwwp(bot: Client, m: Message, user_id: int):
 
-    editable = await m.reply_text("**Enter Woking Access Token\n\nOR\n\nEnter Phone Number**")
+    editable = await m.reply_text("**Enter Working Access Token\n\nOR\n\nEnter Phone Number**")
 
     try:
         input1 = await bot.listen(chat_id=m.chat.id, filters=filters.user(user_id), timeout=120)
@@ -428,7 +542,7 @@ async def process_pwwp(bot: Client, m: Message, user_id: int):
                 try:
                     async with session.post(f"https://api.penpencil.co/v3/oauth/token", json=payload, headers=headers) as response:
                         access_token = (await response.json())["data"]["access_token"]
-                        monster = await editable.edit(f"<b>Physics Wallah Login Successful ✅</b>\n\n<pre language='Save this Login Token for future usage'>{access_token}</pre>\n\n")
+                        monster = await editable.edit(f"<b>Physics Wallah Login Successful </b>\n\n<pre language='Save this Login Token for future usage'>{access_token}</pre>\n\n")
                         editable = await m.reply_text("**Getting Batches In Your I'd**")
                     
                 except Exception as e:
@@ -449,7 +563,7 @@ async def process_pwwp(bot: Client, m: Message, user_id: int):
                     response.raise_for_status()
                     batches = (await response.json()).get("data", [])
             except Exception as e:
-                await editable.edit("**```\nLogin Failed❗TOKEN IS EXPIRED```\nPlease Enter Working Token\n                       OR\nLogin With Phone Number**")
+                await editable.edit("**```\nLogin Failed TOKEN IS EXPIRED```\nPlease Enter Working Token\n                       OR\nLogin With Phone Number**")
                 return
         
             await editable.edit("**Enter Your Batch Name**")
@@ -631,7 +745,9 @@ async def process_pwwp(bot: Client, m: Message, user_id: int):
             await CONNECTOR.close()
 
 
-# Cp Function 
+# ═══════════════════════════════════════════════════════════════
+# CP (Classplus) Functions
+# ═══════════════════════════════════════════════════════════════
 async def fetch_cpwp_signed_url(url_val: str, name: str, session: aiohttp.ClientSession, headers: Dict[str, str]) -> str | None:
     MAX_RETRIES = 3
     for attempt in range(MAX_RETRIES):
@@ -644,7 +760,6 @@ async def fetch_cpwp_signed_url(url_val: str, name: str, session: aiohttp.Client
                 return signed_url
                 
         except Exception as e:
-         #   logging.exception(f"Unexpected error fetching signed URL for {name}: {e}. Attempt {attempt + 1}/{MAX_RETRIES}")
             pass
 
         if attempt < MAX_RETRIES - 1:
@@ -661,16 +776,13 @@ async def process_cpwp_url(url_val: str, name: str, session: aiohttp.ClientSessi
             return None
 
         if "testbook.com" in url_val or "classplusapp.com/drm" in url_val or "media-cdn.classplusapp.com/drm" in url_val:
-        #    logging.info(f"{name}:{url_val}")
             return f"{name}:{url_val}\n"
 
         async with session.get(signed_url) as response:
             response.raise_for_status()
-       #     logging.info(f"{name}:{url_val}")
             return f"{name}:{url_val}\n"
             
     except Exception as e:
-    #    logging.exception(f"Unexpected error processing {name}: {e}")
         pass
     return None
 
@@ -716,7 +828,7 @@ async def get_cpwp_course_content(session: aiohttp.ClientSession, headers: Dict[
                         identifier = url_val.split('/')[-2]
                         url_val = f'https://media-cdn.classplusapp.com/tencent/{identifier}/master.m3u8'
                     elif "4b06bf8d61c41f8310af9b2624459378203740932b456b07fcf817b737fbae27" in url_val and url_val.endswith('.jpeg'):
-                        url_val = f'https://media-cdn.classplusapp.com/alisg-cdn-a.classplusapp.com/b08bad9ff8d969639b2e43d5769342cc62b510c4345d2f7f153bec53be84fe35/{url_val.split('/')[-1].split('.')[0]}/master.m3u8'
+                        url_val = f'https://media-cdn.classplusapp.com/alisg-cdn-a.classplusapp.com/b08bad9ff8d969639b2e43d5769342cc62b510c4345d2f7f153bec53be84fe35/{url_val.split("/")[-1].split(".")[0]}/master.m3u8'
                     elif "cpvideocdn.testbook.com" in url_val and url_val.endswith('.png'):
                         match = re.search(r'/streams/([a-f0-9]{24})/', url_val)
                         video_id = match.group(1) if match else url_val.split('/')[-2]
@@ -741,7 +853,6 @@ async def get_cpwp_course_content(session: aiohttp.ClientSession, headers: Dict[
                         url_val: str | None = content.get('url')
                         if url_val:
                             fetched_urls.add(url_val)
-                        #    logging.info(f"{name}:{url_val}")
                             results.append(f"{name}:{url_val}\n")
                             if url_val.endswith('.pdf'):
                                 pdf_count += 1
@@ -774,7 +885,6 @@ async def get_cpwp_course_content(session: aiohttp.ClientSession, headers: Dict[
             if nested_results:
                 results.extend(nested_results)
             else:
-            #    logging.warning(f"get_cpwp_course_content returned None for folder_id {folder_id}")
                 pass
             video_count += nested_video_count
             pdf_count += nested_pdf_count
@@ -784,17 +894,19 @@ async def get_cpwp_course_content(session: aiohttp.ClientSession, headers: Dict[
 
     return results, video_count, pdf_count, image_count
 
+
 @bot.on_callback_query(filters.regex("^cpwp$"))
 async def cpwp_callback(bot, callback_query):
     user_id = callback_query.from_user.id
     await callback_query.answer()
     
     if user_id not in auth_users:
-        await bot.send_message(callback_query.message.chat.id, f"**You Are Not Subscribed To This Bot**")
+        await bot.send_message(callback_query.message.chat.id, "**You Are Not Subscribed To This Bot**")
         return
             
-    THREADPOOL.submit(asyncio.run, process_cpwp(bot, callback_query.message, user_id))
+    THREADPOOL.submit(_run_async_in_thread, process_cpwp(bot, callback_query.message, user_id))
     
+
 async def process_cpwp(bot: Client, m: Message, user_id: int):
     
     headers = {
@@ -867,7 +979,7 @@ async def process_cpwp(bot: Client, m: Message, user_id: int):
                                 for cnt, course in enumerate(courses):
                                     name = course['name']
                                     price = course['finalPrice']
-                                    text += f'{cnt + 1}. ```\n{name} 💵₹{price}```\n'
+                                    text += f'{cnt + 1}. ```\n{name} Rs.{price}```\n'
 
                                 await editable.edit(f"**Send index number of the Category Name\n\n{text}\nIf Your Batch Not Listed Then Enter Your Batch Name**")
                             
@@ -907,7 +1019,7 @@ async def process_cpwp(bot: Client, m: Message, user_id: int):
                                                 for cnt, course in enumerate(courses):
                                                     name = course['name']
                                                     price = course['finalPrice']
-                                                    text += f'{cnt + 1}. ```\n{name} 💵₹{price}```\n'
+                                                    text += f'{cnt + 1}. ```\n{name} Rs.{price}```\n'
                                                 await editable.edit(f"**Send index number of the Batch to download.\n\n{text}**")
                                             
                                                 try:
@@ -987,7 +1099,7 @@ async def process_cpwp(bot: Client, m: Message, user_id: int):
 
                                             await editable.delete(True)
                                         
-                                            caption = f"**App Name : ```\n{App_Name}({org_code})```\nBatch Name : ```\n{selected_batch_name}``````\n🎬 : {video_count} | 📁 : {pdf_count} | 🖼  : {image_count}``````\nTime Taken : {formatted_time}```**"
+                                            caption = f"**App Name : ```\n{App_Name}({org_code})```\nBatch Name : ```\n{selected_batch_name}``````\n : {video_count} |  : {pdf_count} |   : {image_count}``````\nTime Taken : {formatted_time}```**"
                                         
                                             with open(file, 'rb') as f:
                                                 doc = await m.reply_document(document=f, caption=caption, file_name=f"{clean_batch_name}.txt")
@@ -1012,8 +1124,10 @@ async def process_cpwp(bot: Client, m: Message, user_id: int):
             await session.close()
             await CONNECTOR.close()
 
- # Start Flask + Bot
+
+# ═══════════════════════════════════════════════════════════════
+# START: Flask + Bot
+# ═══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     threading.Thread(target=run_flask).start()
-    bot.run()                      
-#bot.run()
+    bot.run()
