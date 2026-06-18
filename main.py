@@ -1237,7 +1237,7 @@ async def process_date_content(session, batch_id, batch_name, start_epoch, end_e
             subject_id = schedule_item.get("subjectId", "") or schedule_item.get("batchSubjectId", "")
 
         schedule_id = schedule_item.get("_id", "")
-        topic = schedule_item.get("topic", schedule_item.get("name", "Unknown Topic")).replace("/", "-").replace(":", "-")
+        topic = (schedule_item.get("topic") or schedule_item.get("name") or "Unknown Topic").replace("/", "-").replace(":", "-")
         start_time = schedule_item.get("startTime", schedule_item.get("startDate", ""))
         end_time_val = schedule_item.get("endTime", schedule_item.get("endDate", ""))
 
