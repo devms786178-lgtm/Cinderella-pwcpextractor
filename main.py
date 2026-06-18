@@ -1999,9 +1999,20 @@ async def process_pwwp(bot, m, user_id):
             hardcoded_batch = find_hardcoded_batch(batch_search)
 
             if hardcoded_batch:
-                # Use hardcoded batch data directly - skip API batch search
-                selected_batch_id = hardcoded_batch["_id"]  # Use _id for v2 API calls
+            # Use hardcoded batch data directly - skip API batch search
+                selected_batch_id = hardcoded_batch["_id"]
                 selected_batch_name = hardcoded_batch["name"]
+
+            # Subject data
+                subjects = hardcoded_batch.get("subjects", [])
+
+            for subject in subjects:
+                subject_name = subject.get("subject")
+                subject_id = subject.get("subjectId")
+
+                print(f"Subject: {subject_name}")
+                print(f"Subject ID: {subject_id}")
+
                 clean_batch_name = selected_batch_name.replace("/", "-").replace("|", "-")
                 clean_file_name = f"{user_id}_{clean_batch_name}"
 
