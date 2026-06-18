@@ -2023,8 +2023,8 @@ async def process_pwwp(bot, m, user_id):
                 f"**Extracting using pre-configured batch data...**"
                 )
 
-            if editable.text != new_text:
-            await editable.edit(new_text)
+                if editable.text != new_text:
+                   await editable.edit(new_text)
 
             except Exception as e:
             if "MESSAGE_NOT_MODIFIED" not in str(e):
