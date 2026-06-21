@@ -126,19 +126,24 @@ print(4321)
 # lag raha"). It also only ran once at import time with no retry, so a
 # single transient failure on startup left THUMBNAIL_FILE = None forever.
 THUMB_URL = "https://graph.org/file/5e7dc66913185f41c81ce-78485dba7e5ae7fc8e.jpg"
-THUMB_PATH = "document_thumb.jpg"
-THUMB_MAX_SIDE = 420       # Telegram hard limit
+THUMB_PATH = "document_thumb_v2.jpg"
+THUMB_MAX_SIDE = 320       # Telegram hard limit (matches the doc note above)
 THUMB_MAX_BYTES = 200 * 1024  # Telegram hard limit (< 200KB)
 
 
 def _process_thumbnail_bytes(raw_bytes: bytes, dest_path: str) -> bool:
-    """Save raw image bytes as the thumbnail at dest_path.
+    """Save raw image bytes as a Telegram-compliant thumbnail at dest_path.
 
-    If the source image already satisfies Telegram's limits (valid JPEG,
-    <=320px sides, <200KB), it is written through byte-for-byte with ZERO
-    recompression/resizing - the original image, untouched. Only images
-    that actually violate a limit get resized/re-encoded, and only as much
-    as needed to become Telegram-compliant.
+    IMPORTANT: we ALWAYS force a full re-encode here, even if the source
+    image already looks compliant on dims/size/format. Telegram's thumb
+    uploader silently drops thumbnails that are progressive-encoded JPEGs
+    or carry an ICC/EXIF color profile - both are common for images served
+    by web CDNs (like graph.org) even though they "look like" a normal
+    JPEG. A byte-for-byte passthrough of such a file looked fine locally
+    (valid JPEG, right dims, right size) but Telegram would still reject
+    it with zero error/log on our side. Forcing every image through
+    Pillow's RGB + baseline-JPEG save path guarantees the output is
+    actually compliant, not just superficially compliant.
     """
     try:
         from PIL import Image
@@ -147,25 +152,10 @@ def _process_thumbnail_bytes(raw_bytes: bytes, dest_path: str) -> bool:
         img = Image.open(io.BytesIO(raw_bytes))
         img.load()  # force-decode now so corrupt files raise immediately
 
-        is_jpeg = (img.format or "").upper() in ("JPEG", "JPG")
-        w, h = img.size
-        dim_ok = w <= THUMB_MAX_SIDE and h <= THUMB_MAX_SIDE
-        size_ok = len(raw_bytes) < THUMB_MAX_BYTES
-
-        if is_jpeg and dim_ok and size_ok:
-            # Already fully compliant - write the original bytes as-is
-            with open(dest_path, "wb") as f:
-                f.write(raw_bytes)
-            logging.info(
-                f"Thumbnail saved AS-IS (original, no recompression): "
-                f"{w}x{h}px, {len(raw_bytes) // 1024}KB"
-            )
-            return True
-
-        # Not compliant (wrong format / too big / too large) - fix only what's needed
         if img.mode != "RGB":
             img = img.convert("RGB")
 
+        w, h = img.size
         scale = min(THUMB_MAX_SIDE / w, THUMB_MAX_SIDE / h, 1.0)
         if scale < 1.0:
             img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
@@ -175,7 +165,8 @@ def _process_thumbnail_bytes(raw_bytes: bytes, dest_path: str) -> bool:
         while quality >= 35:
             buf.seek(0)
             buf.truncate(0)
-            img.save(buf, format="JPEG", quality=quality, optimize=True)
+            # progressive=False -> baseline JPEG (required by Telegram's thumb uploader)
+            img.save(buf, format="JPEG", quality=quality, optimize=True, progressive=False)
             if buf.tell() < THUMB_MAX_BYTES:
                 break
             quality -= 10
@@ -184,7 +175,7 @@ def _process_thumbnail_bytes(raw_bytes: bytes, dest_path: str) -> bool:
             f.write(buf.getvalue())
 
         logging.info(
-            f"Thumbnail processed (original was non-compliant): {img.size[0]}x{img.size[1]}px, "
+            f"Thumbnail re-encoded (baseline JPEG, forced): {img.size[0]}x{img.size[1]}px, "
             f"{buf.tell() // 1024}KB, quality={quality}"
         )
         return True
