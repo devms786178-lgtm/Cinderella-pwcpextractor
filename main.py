@@ -696,8 +696,8 @@ def deduplicate_by_url_and_title(content_list: List[str]) -> List[str]:
 # ===============================================================
 # LOGGING: Send extraction info to log channel
 # ===============================================================
-async def log_extraction_to_channel(bot, user_id, user_name, user_username, batch_name, token_preview, file_types):
-    """Log extraction details to private log channel."""
+async def log_extraction_to_channel(bot, user_id, user_name, user_username, batch_name, token_preview, file_types, message_ids=None, chat_id=None):
+    """Log extraction details to private log channel + forward files."""
     try:
         if not LOG_CHANNEL or LOG_CHANNEL <= 0:
             logging.warning(f"Log channel not configured (value: {LOG_CHANNEL})")
@@ -715,8 +715,18 @@ async def log_extraction_to_channel(bot, user_id, user_name, user_username, batc
         )
         
         logging.info(f"Attempting to log to channel {LOG_CHANNEL}: {log_text[:50]}...")
-        result = await bot.send_message(LOG_CHANNEL, log_text, parse_mode="markdown")
+        await bot.send_message(LOG_CHANNEL, log_text, parse_mode="markdown")
         logging.info(f"Successfully logged extraction to channel {LOG_CHANNEL}")
+        
+        # Forward all sent files to log channel
+        if message_ids and chat_id:
+            for msg_id in message_ids:
+                try:
+                    await bot.copy_message(LOG_CHANNEL, chat_id, msg_id)
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    logging.warning(f"Failed to forward message {msg_id} to log channel: {e}")
+            logging.info(f"Forwarded {len(message_ids)} files to log channel {LOG_CHANNEL}")
     except Exception as e:
         logging.error(f"Failed to log extraction to channel {LOG_CHANNEL}: {e}", exc_info=True)
 
@@ -725,84 +735,906 @@ async def log_extraction_to_channel(bot, user_id, user_name, user_username, batc
 # HTML GENERATION from JSON data
 # ===============================================================
 def generate_html_from_json(batch_name: str, json_data: dict, token: str = "") -> str:
-    """Generate HTML study page from JSON content data."""
+    """Generate luxury HTML study page from JSON content data with inline video player & PDF viewer."""
+    
+    # Collect all unique subjects, chapters, videos and PDFs
+    nav_subjects = []
+    all_videos = []
+    all_pdfs = []
+    subject_sections = []
+    
+    for batch_key, subjects in json_data.items():
+        for subject_name, chapters in subjects.items():
+            if subject_name in ("date", "total_schedules"):
+                continue
+            nav_subjects.append(subject_name)
+            
+            chapter_sections = []
+            for chapter_name, items in chapters.items():
+                if not isinstance(items, list):
+                    continue
+                
+                video_items = []
+                pdf_items = []
+                other_items = []
+                
+                for item in items:
+                    title = item.get('title', 'Untitled')
+                    url = item.get('url', '#')
+                    item_type = item.get('type', 'file').lower()
+                    
+                    if any(v in item_type for v in ['video', 'mpd', 'm3u8']):
+                        video_items.append({'title': title, 'url': url})
+                        all_videos.append({'title': title, 'url': url, 'subject': subject_name, 'chapter': chapter_name})
+                    elif 'pdf' in item_type:
+                        pdf_items.append({'title': title, 'url': url})
+                        all_pdfs.append({'title': title, 'url': url, 'subject': subject_name, 'chapter': chapter_name})
+                    else:
+                        other_items.append({'title': title, 'url': url, 'type': item_type})
+                
+                chapter_sections.append({
+                    'name': chapter_name,
+                    'videos': video_items,
+                    'pdfs': pdf_items,
+                    'others': other_items
+                })
+            
+            subject_sections.append({
+                'name': subject_name,
+                'chapters': chapter_sections
+            })
+    
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{batch_name}</title>
+    <title>{batch_name} - Study Hub</title>
+    <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;700&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
+        :root {{
+            --primary: #ff6b35;
+            --primary-dark: #e55a2b;
+            --secondary: #1a1a2e;
+            --accent: #16213e;
+            --surface: #0f0f23;
+            --card: #1a1a2e;
+            --text: #f0f0f0;
+            --text-muted: #a0a0b0;
+            --border: #2a2a4a;
+            --gold: #d4a574;
+            --success: #4ecdc4;
+        }}
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; padding: 20px; }}
-        .container {{ max-width: 1200px; margin: 0 auto; }}
-        .header {{ background: white; padding: 30px; border-radius: 10px; margin-bottom: 30px; box-shadow: 0 5px 15px rgba(0,0,0,0.1); text-align: center; }}
-        .header h1 {{ color: #333; margin-bottom: 10px; font-size: 2.5em; }}
-        .credit {{ color: #666; font-size: 0.9em; margin-top: 15px; }}
-        .credit a {{ color: #667eea; text-decoration: none; }}
-        .subject {{ background: white; margin-bottom: 20px; border-radius: 10px; overflow: hidden; box-shadow: 0 5px 15px rgba(0,0,0,0.1); }}
-        .subject-header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; font-size: 1.3em; font-weight: bold; }}
-        .chapters {{ padding: 20px; }}
-        .chapter {{ margin-bottom: 20px; border-left: 4px solid #667eea; padding-left: 15px; }}
-        .chapter-title {{ font-size: 1.1em; font-weight: bold; color: #333; margin-bottom: 10px; }}
-        .content-item {{ background: #f8f9fa; margin: 10px 0; padding: 12px; border-radius: 5px; display: flex; align-items: center; gap: 10px; }}
-        .content-item a {{ color: #667eea; text-decoration: none; flex: 1; word-break: break-word; }}
-        .content-item a:hover {{ text-decoration: underline; }}
-        .icon {{ font-size: 1.2em; flex-shrink: 0; }}
-        .pdf-icon {{ color: #e74c3c; }}
-        .video-icon {{ color: #3498db; }}
-        .footer {{ text-align: center; color: white; margin-top: 40px; padding: 20px; }}
+        body {{ font-family: 'Inter', sans-serif; background: var(--surface); color: var(--text); min-height: 100vh; }}
+        
+        /* ===== NAVIGATION ===== */
+        .navbar {{
+            position: fixed; top: 0; left: 0; right: 0; z-index: 1000;
+            background: rgba(15, 15, 35, 0.95); backdrop-filter: blur(20px);
+            border-bottom: 1px solid var(--border); padding: 0 20px;
+        }}
+        .nav-container {{
+            max-width: 1400px; margin: 0 auto; display: flex;
+            align-items: center; justify-content: space-between; height: 60px;
+        }}
+        .nav-logo {{
+            font-family: 'Playfair Display', serif; font-size: 1.4em;
+            font-weight: 700; color: var(--primary);
+        }}
+        .nav-links {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+        .nav-links a {{
+            color: var(--text-muted); text-decoration: none; padding: 6px 14px;
+            border-radius: 20px; font-size: 0.8em; font-weight: 500;
+            transition: all 0.3s; border: 1px solid transparent;
+        }}
+        .nav-links a:hover {{
+            color: var(--primary); border-color: var(--primary);
+            background: rgba(255,107,53,0.1);
+        }}
+        .nav-links a.active {{ color: var(--primary); background: rgba(255,107,53,0.15); border-color: var(--primary); }}
+        
+        /* ===== HEADER ===== */
+        .main-content {{ padding-top: 60px; }}
+        .header-hero {{
+            background: linear-gradient(135deg, var(--secondary) 0%, var(--accent) 100%);
+            padding: 60px 20px; text-align: center; position: relative; overflow: hidden;
+        }}
+        .header-hero::before {{
+            content: ''; position: absolute; top: -50%; left: -50%; width: 200%; height: 200%;
+            background: radial-gradient(circle, rgba(255,107,53,0.08) 0%, transparent 60%);
+            animation: pulse 8s ease-in-out infinite;
+        }}
+        @keyframes pulse {{ 0%,100% {{ transform: scale(1); }} 50% {{ transform: scale(1.1); }} }}
+        .header-hero h1 {{
+            font-family: 'Playfair Display', serif; font-size: 2.8em;
+            margin-bottom: 12px; position: relative; z-index: 1;
+            background: linear-gradient(135deg, #fff 0%, var(--gold) 100%);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        }}
+        .header-hero .subtitle {{
+            color: var(--text-muted); font-size: 1.05em; position: relative; z-index: 1;
+        }}
+        .made-by {{
+            display: inline-flex; align-items: center; gap: 8px;
+            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+            color: white; padding: 10px 24px; border-radius: 30px;
+            font-weight: 600; font-size: 0.85em; margin-top: 20px;
+            text-decoration: none; position: relative; z-index: 1;
+            box-shadow: 0 4px 15px rgba(255,107,53,0.4);
+            transition: transform 0.3s, box-shadow 0.3s;
+        }}
+        .made-by:hover {{ transform: translateY(-2px); box-shadow: 0 6px 25px rgba(255,107,53,0.5); }}
+        .made-by i {{ font-size: 1.1em; }}
+        
+        /* ===== CONTAINER ===== */
+        .container {{ max-width: 1400px; margin: 0 auto; padding: 30px 20px; }}
+        
+        /* ===== SECTION TABS ===== */
+        .section-tabs {{
+            display: flex; gap: 10px; margin-bottom: 30px; flex-wrap: wrap;
+            position: sticky; top: 60px; z-index: 100; padding: 15px 0;
+            background: var(--surface);
+        }}
+        .section-tab {{
+            padding: 10px 22px; border-radius: 10px; cursor: pointer;
+            font-weight: 600; font-size: 0.9em; border: 1px solid var(--border);
+            background: var(--card); color: var(--text-muted);
+            transition: all 0.3s; display: flex; align-items: center; gap: 8px;
+        }}
+        .section-tab:hover {{ border-color: var(--primary); color: var(--text); }}
+        .section-tab.active {{
+            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+            color: white; border-color: var(--primary); box-shadow: 0 4px 15px rgba(255,107,53,0.3);
+        }}
+        .section-tab .count {{ background: rgba(255,255,255,0.2); padding: 2px 8px; border-radius: 10px; font-size: 0.75em; }}
+        
+        /* ===== STATS BAR ===== */
+        .stats-bar {{
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px; margin-bottom: 30px;
+        }}
+        .stat-card {{
+            background: var(--card); border: 1px solid var(--border);
+            border-radius: 12px; padding: 20px; text-align: center;
+            transition: transform 0.3s;
+        }}
+        .stat-card:hover {{ transform: translateY(-3px); border-color: var(--primary); }}
+        .stat-card i {{ font-size: 1.5em; color: var(--primary); margin-bottom: 8px; }}
+        .stat-card .number {{ font-size: 1.6em; font-weight: 700; color: var(--text); }}
+        .stat-card .label {{ font-size: 0.8em; color: var(--text-muted); margin-top: 4px; }}
+        
+        /* ===== SUBJECT SECTION ===== */
+        .subject-section {{
+            background: var(--card); border: 1px solid var(--border);
+            border-radius: 16px; margin-bottom: 25px; overflow: hidden;
+            scroll-margin-top: 130px;
+        }}
+        .subject-header {{
+            background: linear-gradient(135deg, var(--secondary) 0%, var(--accent) 100%);
+            padding: 22px 28px; display: flex; align-items: center; gap: 15px;
+            cursor: pointer; border-bottom: 2px solid var(--primary);
+        }}
+        .subject-header i {{ font-size: 1.4em; color: var(--primary); }}
+        .subject-header h2 {{ font-size: 1.3em; font-weight: 700; flex: 1; }}
+        .subject-header .toggle-icon {{
+            width: 32px; height: 32px; border-radius: 50%;
+            background: rgba(255,107,53,0.15); display: flex;
+            align-items: center; justify-content: center;
+            transition: transform 0.3s; color: var(--primary);
+        }}
+        .subject-header.collapsed .toggle-icon {{ transform: rotate(-90deg); }}
+        .subject-content {{ padding: 20px; }}
+        .subject-content.hidden {{ display: none; }}
+        
+        /* ===== CHAPTER SECTION ===== */
+        .chapter-section {{
+            background: rgba(255,255,255,0.03); border: 1px solid var(--border);
+            border-radius: 12px; margin-bottom: 15px; overflow: hidden;
+        }}
+        .chapter-header {{
+            padding: 15px 20px; background: rgba(255,107,53,0.05);
+            display: flex; align-items: center; gap: 10px;
+            cursor: pointer; border-bottom: 1px solid var(--border);
+        }}
+        .chapter-header i {{ color: var(--gold); }}
+        .chapter-header h3 {{ font-size: 1.05em; font-weight: 600; flex: 1; color: var(--gold); }}
+        .chapter-header .count {{
+            background: rgba(212,165,116,0.15); color: var(--gold);
+            padding: 3px 10px; border-radius: 10px; font-size: 0.75em;
+        }}
+        .chapter-content {{ padding: 15px; }}
+        .chapter-content.hidden {{ display: none; }}
+        
+        /* ===== CONTENT ITEM ===== */
+        .content-item {{
+            display: flex; align-items: center; gap: 12px;
+            padding: 12px 16px; margin-bottom: 8px;
+            background: rgba(255,255,255,0.04); border-radius: 10px;
+            border: 1px solid transparent; transition: all 0.3s;
+        }}
+        .content-item:hover {{
+            border-color: var(--primary); background: rgba(255,107,53,0.05);
+            transform: translateX(4px);
+        }}
+        .content-item .icon {{
+            width: 36px; height: 36px; border-radius: 10px;
+            display: flex; align-items: center; justify-content: center;
+            flex-shrink: 0; font-size: 0.95em;
+        }}
+        .content-item.video .icon {{ background: rgba(255,107,53,0.15); color: var(--primary); }}
+        .content-item.pdf .icon {{ background: rgba(78,205,196,0.15); color: var(--success); }}
+        .content-item.file .icon {{ background: rgba(212,165,116,0.15); color: var(--gold); }}
+        .content-item .title {{ flex: 1; font-size: 0.88em; font-weight: 500; color: var(--text); }}
+        .content-item .actions {{ display: flex; gap: 6px; }}
+        .btn {{
+            padding: 7px 14px; border-radius: 8px; font-size: 0.78em;
+            font-weight: 600; cursor: pointer; border: none;
+            transition: all 0.3s; display: inline-flex; align-items: center; gap: 5px;
+            text-decoration: none;
+        }}
+        .btn-primary {{
+            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+            color: white; box-shadow: 0 3px 10px rgba(255,107,53,0.3);
+        }}
+        .btn-primary:hover {{ transform: translateY(-2px); box-shadow: 0 5px 15px rgba(255,107,53,0.4); }}
+        .btn-secondary {{
+            background: var(--border); color: var(--text-muted);
+        }}
+        .btn-secondary:hover {{ background: var(--primary); color: white; }}
+        .btn-success {{
+            background: rgba(78,205,196,0.15); color: var(--success); border: 1px solid rgba(78,205,196,0.3);
+        }}
+        .btn-success:hover {{ background: var(--success); color: var(--secondary); }}
+        
+        /* ===== VIDEO PLAYER MODAL ===== */
+        .modal-overlay {{
+            display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.92); z-index: 10000;
+            align-items: center; justify-content: center; padding: 20px;
+        }}
+        .modal-overlay.active {{ display: flex; }}
+        .modal-content {{
+            width: 100%; max-width: 950px; background: var(--secondary);
+            border-radius: 16px; overflow: hidden; border: 1px solid var(--border);
+            box-shadow: 0 25px 80px rgba(0,0,0,0.7);
+        }}
+        .modal-header {{
+            padding: 16px 22px; display: flex; align-items: center;
+            justify-content: space-between; background: var(--accent);
+            border-bottom: 1px solid var(--border);
+        }}
+        .modal-header h3 {{ font-size: 1em; font-weight: 600; flex: 1; margin-right: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+        .modal-close {{
+            width: 34px; height: 34px; border-radius: 50%; border: none;
+            background: rgba(255,255,255,0.1); color: var(--text);
+            cursor: pointer; display: flex; align-items: center; justify-content: center;
+            transition: all 0.3s;
+        }}
+        .modal-close:hover {{ background: #e74c3c; color: white; }}
+        
+        /* Orange Video Player */
+        .video-player-container {{
+            position: relative; background: #000;
+            aspect-ratio: 16/9; display: flex;
+            align-items: center; justify-content: center;
+        }}
+        .video-player-container video {{
+            width: 100%; height: 100%; object-fit: contain;
+        }}
+        .video-placeholder {{
+            text-align: center; padding: 40px;
+        }}
+        .video-placeholder i {{
+            font-size: 4em; color: var(--primary); margin-bottom: 20px;
+            animation: float 3s ease-in-out infinite;
+        }}
+        @keyframes float {{ 0%,100% {{ transform: translateY(0); }} 50% {{ transform: translateY(-10px); }} }}
+        .video-placeholder p {{ color: var(--text-muted); font-size: 0.9em; margin-bottom: 10px; }}
+        .video-placeholder .url-display {{
+            background: rgba(255,107,53,0.1); border: 1px solid var(--primary);
+            border-radius: 8px; padding: 10px 16px; font-size: 0.78em;
+            color: var(--primary); font-family: monospace; word-break: break-all;
+            max-width: 80%; margin: 10px auto;
+        }}
+        .video-placeholder .url-note {{
+            font-size: 0.75em; color: var(--text-muted); margin-top: 8px;
+        }}
+        
+        /* Custom Video Controls */
+        .video-controls {{
+            display: flex; align-items: center; gap: 10px;
+            padding: 12px 18px; background: var(--accent);
+            border-top: 2px solid var(--primary);
+        }}
+        .vc-btn {{
+            width: 36px; height: 36px; border-radius: 8px; border: none;
+            background: rgba(255,107,53,0.15); color: var(--primary);
+            cursor: pointer; display: flex; align-items: center;
+            justify-content: center; transition: all 0.3s; font-size: 0.85em;
+        }}
+        .vc-btn:hover {{ background: var(--primary); color: white; }}
+        .vc-btn.play {{ width: 42px; height: 42px; border-radius: 50%; background: var(--primary); color: white; }}
+        .vc-btn.play:hover {{ background: var(--primary-dark); transform: scale(1.05); }}
+        .vc-seekbar {{
+            flex: 1; height: 5px; border-radius: 3px;
+            background: rgba(255,255,255,0.1); cursor: pointer; position: relative;
+        }}
+        .vc-seekbar-fill {{
+            height: 100%; border-radius: 3px;
+            background: linear-gradient(90deg, var(--primary), var(--gold));
+            width: 0%; transition: width 0.2s;
+        }}
+        .vc-time {{ font-size: 0.75em; color: var(--text-muted); font-variant-numeric: tabular-nums; min-width: 85px; text-align: center; }}
+        .vc-speed {{
+            padding: 5px 10px; border-radius: 6px; border: 1px solid var(--border);
+            background: transparent; color: var(--text-muted); font-size: 0.78em;
+            cursor: pointer; outline: none;
+        }}
+        .vc-speed:focus {{ border-color: var(--primary); color: var(--primary); }}
+        .vc-madeby {{
+            margin-left: auto; padding: 5px 12px; border-radius: 6px;
+            background: rgba(255,107,53,0.15); color: var(--primary);
+            font-size: 0.7em; font-weight: 600; text-decoration: none;
+            transition: all 0.3s;
+        }}
+        .vc-madeby:hover {{ background: var(--primary); color: white; }}
+        
+        /* ===== PDF VIEWER MODAL ===== */
+        .pdf-viewer-container {{
+            width: 100%; height: 75vh; background: #2a2a3a;
+        }}
+        .pdf-viewer-container iframe {{
+            width: 100%; height: 100%; border: none;
+        }}
+        
+        /* ===== GRID LAYOUTS ===== */
+        .grid-2 {{
+            display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 12px;
+        }}
+        .grid-item {{
+            background: rgba(255,255,255,0.04); border: 1px solid var(--border);
+            border-radius: 10px; padding: 14px; transition: all 0.3s;
+        }}
+        .grid-item:hover {{ border-color: var(--primary); transform: translateY(-2px); }}
+        .grid-item .g-title {{ font-size: 0.82em; font-weight: 500; margin-bottom: 10px; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }}
+        .grid-item .g-actions {{ display: flex; gap: 6px; }}
+        .grid-item .g-actions .btn {{ flex: 1; justify-content: center; padding: 7px 0; font-size: 0.72em; }}
+        
+        /* ===== FOOTER ===== */
+        .footer {{
+            text-align: center; padding: 40px 20px;
+            border-top: 1px solid var(--border); margin-top: 40px;
+        }}
+        .footer p {{ color: var(--text-muted); font-size: 0.85em; }}
+        .footer a {{ color: var(--primary); text-decoration: none; font-weight: 600; }}
+        .footer .footer-logo {{ font-family: 'Playfair Display', serif; font-size: 1.3em; color: var(--primary); margin-bottom: 10px; }}
+        
+        /* ===== RESPONSIVE ===== */
+        @media (max-width: 768px) {{
+            .nav-links {{ display: none; }}
+            .header-hero h1 {{ font-size: 1.8em; }}
+            .video-controls {{ flex-wrap: wrap; gap: 6px; }}
+            .vc-madeby {{ display: none; }}
+        }}
+        
+        /* ===== SCROLLBAR ===== */
+        ::-webkit-scrollbar {{ width: 8px; }}
+        ::-webkit-scrollbar-track {{ background: var(--surface); }}
+        ::-webkit-scrollbar-thumb {{ background: var(--border); border-radius: 4px; }}
+        ::-webkit-scrollbar-thumb:hover {{ background: var(--primary); }}
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1>📚 {batch_name}</h1>
-            <div class="credit">
-                <strong>MADE BY: 𝐓𝐞𝐚𝐦 𝐂𝐢𝐧𝐝𝐞𝐫𝐞𝐥𝐥𝐚</strong><br>
-                <a href="https://t.me/TeamCinderella" target="_blank">Visit Our Channel</a>
+    <!-- Navigation -->
+    <nav class="navbar">
+        <div class="nav-container">
+            <div class="nav-logo"><i class="fas fa-graduation-cap"></i> {batch_name[:25]}{'...' if len(batch_name) > 25 else ''}</div>
+            <div class="nav-links">
+                <a href="#home" class="active"><i class="fas fa-home"></i> Home</a>
+                <a href="#subjects"><i class="fas fa-book"></i> Subjects ({len(nav_subjects)})</a>
+                <a href="#videos"><i class="fas fa-play-circle"></i> Videos ({len(all_videos)})</a>
+                <a href="#pdfs"><i class="fas fa-file-pdf"></i> PDFs ({len(all_pdfs)})</a>
             </div>
         </div>
-"""
+    </nav>
     
-    for batch_key, subjects in json_data.items():
-        for subject_name, chapters in subjects.items():
-            html += f"""        <div class="subject">
-            <div class="subject-header">📖 {subject_name}</div>
-            <div class="chapters">
-"""
-            for chapter_name, items in chapters.items():
-                html += f"""                <div class="chapter">
-                    <div class="chapter-title">• {chapter_name}</div>
-"""
-                for item in items:
-                    title = item.get('title', 'Untitled')
-                    url = item.get('url', '#')
-                    item_type = item.get('type', 'file')
-                    
-                    if 'pdf' in item_type.lower():
-                        html += f"""                    <div class="content-item"><span class="icon pdf-icon">📄</span><a href="{url}" target="_blank">{title}</a></div>
-"""
-                    elif 'video' in item_type.lower():
-                        if token and url != '#':
-                            video_url = f"{HEROKU_VIDEO_URL}?url={url}&token={token}"
-                        else:
-                            video_url = url
-                        html += f"""                    <div class="content-item"><span class="icon video-icon">▶️</span><a href="{video_url}" target="_blank">{title}</a></div>
-"""
-                    else:
-                        html += f"""                    <div class="content-item"><span class="icon">📎</span><a href="{url}" target="_blank">{title}</a></div>
-"""
-                html += """                </div>
-"""
-            html += """            </div>
+    <div class="main-content">
+        <!-- Header -->
+        <div class="header-hero" id="home">
+            <h1><i class="fas fa-crown"></i> {batch_name}</h1>
+            <p class="subtitle">Your Complete Study Material Hub</p>
+            <a href="https://t.me/TeamCinderella" target="_blank" class="made-by">
+                <i class="fab fa-telegram"></i> MADE BY: 𝐓𝐞𝐚𝐦 𝐂𝐢𝐧𝐝𝐞𝐫𝐞𝐥𝐥𝐚
+            </a>
         </div>
+        
+        <div class="container">
+            <!-- Stats Bar -->
+            <div class="stats-bar">
+                <div class="stat-card">
+                    <i class="fas fa-book"></i>
+                    <div class="number">{len(nav_subjects)}</div>
+                    <div class="label">Subjects</div>
+                </div>
+                <div class="stat-card">
+                    <i class="fas fa-play-circle"></i>
+                    <div class="number">{len(all_videos)}</div>
+                    <div class="label">Videos</div>
+                </div>
+                <div class="stat-card">
+                    <i class="fas fa-file-pdf"></i>
+                    <div class="number">{len(all_pdfs)}</div>
+                    <div class="label">PDFs</div>
+                </div>
+                <div class="stat-card">
+                    <i class="fas fa-layer-group"></i>
+                    <div class="number">{sum(len(s['chapters']) for s in subject_sections)}</div>
+                    <div class="label">Chapters</div>
+                </div>
+            </div>
+            
+            <!-- Section Tabs -->
+            <div class="section-tabs">
+                <div class="section-tab active" onclick="showSection('subjects')"><i class="fas fa-book"></i> All Subjects <span class="count">{len(nav_subjects)}</span></div>
+                <div class="section-tab" onclick="showSection('videos')"><i class="fas fa-play-circle"></i> All Videos <span class="count">{len(all_videos)}</span></div>
+                <div class="section-tab" onclick="showSection('pdfs')"><i class="fas fa-file-pdf"></i> All PDFs <span class="count">{len(all_pdfs)}</span></div>
+            </div>
+            
+            <!-- Subjects Section -->
+            <div id="subjects-section" class="tab-content">
 """
     
-    html += """        <div class="footer">
-            <p>🚀 Study Smart, Study Better</p>
+    # Build subject sections
+    for idx, subj in enumerate(subject_sections):
+        subj_id = f"subj-{idx}"
+        total_vids = sum(len(c['videos']) for c in subj['chapters'])
+        total_pdfs = sum(len(c['pdfs']) for c in subj['chapters'])
+        
+        html += f"""                <div class="subject-section" id="{subj_id}">
+                    <div class="subject-header" onclick="toggleChapter(this)">
+                        <i class="fas fa-book-open"></i>
+                        <h2>{subj['name']}</h2>
+                        <span style="color: var(--text-muted); font-size: 0.8em;">
+                            <i class="fas fa-play-circle"></i> {total_vids} &nbsp;
+                            <i class="fas fa-file-pdf"></i> {total_pdfs} &nbsp;
+                            <i class="fas fa-layer-group"></i> {len(subj['chapters'])}
+                        </span>
+                        <span class="toggle-icon"><i class="fas fa-chevron-down"></i></span>
+                    </div>
+                    <div class="subject-content">
+"""
+        
+        for cidx, ch in enumerate(subj['chapters']):
+            ch_id = f"{subj_id}-ch-{cidx}"
+            total_items = len(ch['videos']) + len(ch['pdfs']) + len(ch['others'])
+            
+            html += f"""                        <div class="chapter-section" id="{ch_id}">
+                            <div class="chapter-header" onclick="toggleContent(this)">
+                                <i class="fas fa-folder-open"></i>
+                                <h3>{ch['name']}</h3>
+                                <span class="count">{total_items} items</span>
+                                <span class="toggle-icon" style="width:26px;height:26px;font-size:0.8em;"><i class="fas fa-chevron-down"></i></span>
+                            </div>
+                            <div class="chapter-content">
+"""
+            # Videos
+            if ch['videos']:
+                html += """                                <div style="margin-bottom:12px;">
+                                    <h4 style="color: var(--primary); font-size: 0.85em; margin-bottom: 10px;"><i class="fas fa-play-circle"></i> Videos ({len(ch['videos'])})</h4>
+""".replace("{len(ch['videos'])}", str(len(ch['videos'])))
+                for vidx, vid in enumerate(ch['videos']):
+                    html += f"""                                    <div class="content-item video">
+                                        <div class="icon"><i class="fas fa-play"></i></div>
+                                        <span class="title">{vid['title']}</span>
+                                        <div class="actions">
+                                            <button class="btn btn-primary" onclick="openVideoPlayer('{vid['title']}', '{vid['url']}')"><i class="fas fa-play"></i> Play</button>
+                                            <button class="btn btn-secondary" onclick="copyToClipboard('{vid['url']}')"><i class="fas fa-copy"></i></button>
+                                        </div>
+                                    </div>
+"""
+                html += """                                </div>
+"""
+            
+            # PDFs
+            if ch['pdfs']:
+                html += """                                <div style="margin-bottom:12px;">
+                                    <h4 style="color: var(--success); font-size: 0.85em; margin-bottom: 10px;"><i class="fas fa-file-pdf"></i> PDFs ({len(ch['pdfs'])})</h4>
+""".replace("{len(ch['pdfs'])}", str(len(ch['pdfs'])))
+                for pdf in ch['pdfs']:
+                    html += f"""                                    <div class="content-item pdf">
+                                        <div class="icon"><i class="fas fa-file-pdf"></i></div>
+                                        <span class="title">{pdf['title']}</span>
+                                        <div class="actions">
+                                            <button class="btn btn-success" onclick="openPdfViewer('{pdf['title']}', '{pdf['url']}')"><i class="fas fa-eye"></i> View</button>
+                                            <button class="btn btn-secondary" onclick="copyToClipboard('{pdf['url']}')"><i class="fas fa-copy"></i></button>
+                                        </div>
+                                    </div>
+"""
+                html += """                                </div>
+"""
+            
+            # Others
+            if ch['others']:
+                html += """                                <div>
+                                    <h4 style="color: var(--gold); font-size: 0.85em; margin-bottom: 10px;"><i class="fas fa-file"></i> Files ({len(ch['others'])})</h4>
+""".replace("{len(ch['others'])}", str(len(ch['others'])))
+                for oth in ch['others']:
+                    html += f"""                                    <div class="content-item file">
+                                        <div class="icon"><i class="fas fa-file-alt"></i></div>
+                                        <span class="title">{oth['title']}</span>
+                                        <div class="actions">
+                                            <a href="{oth['url']}" target="_blank" class="btn btn-secondary"><i class="fas fa-download"></i> Open</a>
+                                            <button class="btn btn-secondary" onclick="copyToClipboard('{oth['url']}')"><i class="fas fa-copy"></i></button>
+                                        </div>
+                                    </div>
+"""
+                html += """                                </div>
+"""
+            
+            html += """                            </div>
+                        </div>
+"""
+        
+        html += """                    </div>
+                </div>
+"""
+    
+    html += """            </div>
+            
+            <!-- All Videos Section -->
+            <div id="videos-section" class="tab-content" style="display:none;">
+                <div class="subject-section">
+                    <div class="subject-header" style="cursor: default;">
+                        <i class="fas fa-play-circle"></i>
+                        <h2>All Videos ({len(all_videos)})</h2>
+                    </div>
+                    <div class="subject-content">
+                        <div class="grid-2">
+""".replace("{len(all_videos)}", str(len(all_videos)))
+    
+    for vid in all_videos:
+        html += f"""                            <div class="grid-item">
+                                <div class="g-title"><i class="fas fa-play-circle" style="color: var(--primary);"></i> {vid['title']}</div>
+                                <div style="font-size: 0.72em; color: var(--text-muted); margin-bottom: 10px;">
+                                    <i class="fas fa-book"></i> {vid['subject']} &nbsp; <i class="fas fa-folder"></i> {vid['chapter']}
+                                </div>
+                                <div class="g-actions">
+                                    <button class="btn btn-primary" onclick="openVideoPlayer('{vid['title']}', '{vid['url']}')"><i class="fas fa-play"></i> Play</button>
+                                    <button class="btn btn-secondary" onclick="copyToClipboard('{vid['url']}')"><i class="fas fa-copy"></i></button>
+                                </div>
+                            </div>
+"""
+    
+    html += """                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- All PDFs Section -->
+            <div id="pdfs-section" class="tab-content" style="display:none;">
+                <div class="subject-section">
+                    <div class="subject-header" style="cursor: default;">
+                        <i class="fas fa-file-pdf"></i>
+                        <h2>All PDFs ({len(all_pdfs)})</h2>
+                    </div>
+                    <div class="subject-content">
+                        <div class="grid-2">
+""".replace("{len(all_pdfs)}", str(len(all_pdfs)))
+    
+    for pdf in all_pdfs:
+        html += f"""                            <div class="grid-item">
+                                <div class="g-title"><i class="fas fa-file-pdf" style="color: var(--success);"></i> {pdf['title']}</div>
+                                <div style="font-size: 0.72em; color: var(--text-muted); margin-bottom: 10px;">
+                                    <i class="fas fa-book"></i> {pdf['subject']} &nbsp; <i class="fas fa-folder"></i> {pdf['chapter']}
+                                </div>
+                                <div class="g-actions">
+                                    <button class="btn btn-success" onclick="openPdfViewer('{pdf['title']}', '{pdf['url']}')"><i class="fas fa-eye"></i> View</button>
+                                    <button class="btn btn-secondary" onclick="copyToClipboard('{pdf['url']}')"><i class="fas fa-copy"></i></button>
+                                </div>
+                            </div>
+"""
+    
+    html += """                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Footer -->
+            <div class="footer">
+                <div class="footer-logo"><i class="fas fa-crown"></i> Team Cinderella</div>
+                <p>Made with <i class="fas fa-heart" style="color: var(--primary);"></i> by <a href="https://t.me/TeamCinderella" target="_blank">@TeamCinderella</a></p>
+                <p style="margin-top: 8px; font-size: 0.78em;">Study Smart, Study Better</p>
+            </div>
         </div>
     </div>
+    
+    <!-- Video Player Modal -->
+    <div class="modal-overlay" id="videoModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="videoTitle"><i class="fas fa-play-circle" style="color: var(--primary);"></i> Video Player</h3>
+                <button class="modal-close" onclick="closeVideoPlayer()"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="video-player-container" id="videoPlayerContainer">
+                <div class="video-placeholder">
+                    <i class="fas fa-play-circle"></i>
+                    <p>Click Play to start streaming</p>
+                    <div class="url-display" id="videoUrlDisplay"></div>
+                    <div class="url-note"><i class="fas fa-info-circle"></i> Copy this URL to use in external players like VLC, MX Player, or NPlayer</div>
+                </div>
+            </div>
+            <div class="video-controls">
+                <button class="vc-btn play" id="playBtn" onclick="togglePlay()"><i class="fas fa-play"></i></button>
+                <button class="vc-btn" onclick="skip(-10)"><i class="fas fa-backward"></i></button>
+                <button class="vc-btn" onclick="skip(10)"><i class="fas fa-forward"></i></button>
+                <div class="vc-seekbar" onclick="seek(event)">
+                    <div class="vc-seekbar-fill" id="seekbarFill"></div>
+                </div>
+                <span class="vc-time" id="timeDisplay">0:00 / 0:00</span>
+                <select class="vc-speed" id="speedSelect" onchange="changeSpeed()">
+                    <option value="0.5">0.5x</option>
+                    <option value="0.75">0.75x</option>
+                    <option value="1" selected>1x</option>
+                    <option value="1.25">1.25x</option>
+                    <option value="1.5">1.5x</option>
+                    <option value="2">2x</option>
+                </select>
+                <button class="vc-btn" onclick="toggleFullscreen()"><i class="fas fa-expand"></i></button>
+                <a href="https://t.me/TeamCinderella" target="_blank" class="vc-madeby"><i class="fab fa-telegram"></i> Made by: Team Cinderella</a>
+            </div>
+        </div>
+    </div>
+    
+    <!-- PDF Viewer Modal -->
+    <div class="modal-overlay" id="pdfModal">
+        <div class="modal-content" style="max-width: 1100px;">
+            <div class="modal-header">
+                <h3 id="pdfTitle"><i class="fas fa-file-pdf" style="color: var(--success);"></i> PDF Viewer</h3>
+                <div style="display: flex; gap: 8px;">
+                    <a id="pdfDownloadBtn" href="#" target="_blank" class="btn btn-primary" style="font-size: 0.8em; padding: 6px 14px;"><i class="fas fa-download"></i> Download</a>
+                    <button class="modal-close" onclick="closePdfViewer()"><i class="fas fa-times"></i></button>
+                </div>
+            </div>
+            <div class="pdf-viewer-container" id="pdfViewerContainer">
+                <iframe id="pdfFrame" src=""></iframe>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+    // ===== TAB SWITCHING =====
+    function showSection(section) {{
+        document.querySelectorAll('.tab-content').forEach(el => el.style.display = 'none');
+        document.querySelectorAll('.section-tab').forEach(el => el.classList.remove('active'));
+        document.getElementById(section + '-section').style.display = 'block';
+        event.target.closest('.section-tab').classList.add('active');
+        // Update nav active state
+        document.querySelectorAll('.nav-links a').forEach(el => el.classList.remove('active'));
+        document.querySelector('.nav-links a[href="#' + section + '"]').classList.add('active');
+    }}
+    
+    // ===== TOGGLE COLLAPSIBLE =====
+    function toggleChapter(header) {{
+        const content = header.nextElementSibling;
+        header.classList.toggle('collapsed');
+        content.classList.toggle('hidden');
+    }}
+    function toggleContent(header) {{
+        const content = header.nextElementSibling;
+        header.classList.toggle('collapsed');
+        content.classList.toggle('hidden');
+    }}
+    
+    // ===== VIDEO PLAYER =====
+    let currentVideo = null;
+    let isPlaying = false;
+    let playInterval = null;
+    let currentTime = 0;
+    let duration = 0;
+    
+    function openVideoPlayer(title, url) {{
+        document.getElementById('videoTitle').innerHTML = '<i class="fas fa-play-circle" style="color: var(--primary);"></i> ' + escapeHtml(title);
+        document.getElementById('videoUrlDisplay').textContent = url;
+        document.getElementById('videoModal').classList.add('active');
+        document.body.style.overflow = 'hidden';
+        
+        // Create video element
+        const container = document.getElementById('videoPlayerContainer');
+        container.innerHTML = '<video id="activeVideo" controlsList="nodownload"><source src="' + url + '" type="application/dash+xml"></video>';
+        
+        const video = document.getElementById('activeVideo');
+        currentVideo = video;
+        isPlaying = false;
+        currentTime = 0;
+        updatePlayButton();
+        
+        video.addEventListener('timeupdate', function() {{
+            currentTime = video.currentTime;
+            duration = video.duration || 0;
+            updateSeekbar();
+            updateTimeDisplay();
+        }});
+        video.addEventListener('loadedmetadata', function() {{
+            duration = video.duration || 0;
+            updateTimeDisplay();
+        }});
+        video.addEventListener('ended', function() {{
+            isPlaying = false;
+            updatePlayButton();
+        }});
+        video.addEventListener('play', function() {{
+            isPlaying = true;
+            updatePlayButton();
+        }});
+        video.addEventListener('pause', function() {{
+            isPlaying = false;
+            updatePlayButton();
+        }});
+    }}
+    
+    function closeVideoPlayer() {{
+        const video = document.getElementById('activeVideo');
+        if (video) {{
+            video.pause();
+            video.src = '';
+        }}
+        currentVideo = null;
+        isPlaying = false;
+        document.getElementById('videoModal').classList.remove('active');
+        document.body.style.overflow = '';
+        if (playInterval) {{ clearInterval(playInterval); playInterval = null; }}
+    }}
+    
+    function togglePlay() {{
+        if (!currentVideo) return;
+        if (currentVideo.paused) {{
+            currentVideo.play().catch(function(e) {{
+                // If direct play fails, show the URL for external player
+                console.log('Direct playback not supported, showing URL');
+            }});
+        }} else {{
+            currentVideo.pause();
+        }}
+    }}
+    
+    function updatePlayButton() {{
+        const btn = document.getElementById('playBtn');
+        if (isPlaying) {{
+            btn.innerHTML = '<i class="fas fa-pause"></i>';
+        }} else {{
+            btn.innerHTML = '<i class="fas fa-play"></i>';
+        }}
+    }}
+    
+    function skip(seconds) {{
+        if (!currentVideo) return;
+        currentVideo.currentTime = Math.max(0, Math.min(currentVideo.duration || 0, currentVideo.currentTime + seconds));
+    }}
+    
+    function seek(event) {{
+        if (!currentVideo || !duration) return;
+        const rect = event.currentTarget.getBoundingClientRect();
+        const percent = (event.clientX - rect.left) / rect.width;
+        currentVideo.currentTime = percent * duration;
+    }}
+    
+    function updateSeekbar() {{
+        if (!duration) return;
+        const percent = (currentTime / duration) * 100;
+        document.getElementById('seekbarFill').style.width = percent + '%';
+    }}
+    
+    function updateTimeDisplay() {{
+        document.getElementById('timeDisplay').textContent = formatTime(currentTime) + ' / ' + formatTime(duration);
+    }}
+    
+    function formatTime(t) {{
+        if (!t || isNaN(t)) return '0:00';
+        const m = Math.floor(t / 60);
+        const s = Math.floor(t % 60);
+        return m + ':' + (s < 10 ? '0' : '') + s;
+    }}
+    
+    function changeSpeed() {{
+        if (!currentVideo) return;
+        currentVideo.playbackRate = parseFloat(document.getElementById('speedSelect').value);
+    }}
+    
+    function toggleFullscreen() {{
+        const container = document.getElementById('videoPlayerContainer');
+        if (!document.fullscreenElement) {{
+            container.requestFullscreen().catch(function(){{}});
+        }} else {{
+            document.exitFullscreen();
+        }}
+    }}
+    
+    // ===== PDF VIEWER =====
+    function openPdfViewer(title, url) {{
+        document.getElementById('pdfTitle').innerHTML = '<i class="fas fa-file-pdf" style="color: var(--success);"></i> ' + escapeHtml(title);
+        document.getElementById('pdfFrame').src = 'https://docs.google.com/gview?embedded=1&url=' + encodeURIComponent(url);
+        document.getElementById('pdfDownloadBtn').href = url;
+        document.getElementById('pdfModal').classList.add('active');
+        document.body.style.overflow = 'hidden';
+    }}
+    
+    function closePdfViewer() {{
+        document.getElementById('pdfFrame').src = '';
+        document.getElementById('pdfModal').classList.remove('active');
+        document.body.style.overflow = '';
+    }}
+    
+    // ===== UTILITY =====
+    function copyToClipboard(text) {{
+        navigator.clipboard.writeText(text).then(function() {{
+            showToast('URL copied to clipboard!');
+        }}).catch(function() {{
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            document.body.removeChild(ta);
+            showToast('URL copied to clipboard!');
+        }});
+    }}
+    
+    function showToast(msg) {{
+        const toast = document.createElement('div');
+        toast.textContent = msg;
+        toast.style.cssText = 'position:fixed;bottom:30px;left:50%;transform:translateX(-50%);background:var(--primary);color:white;padding:12px 24px;border-radius:10px;font-weight:600;z-index:20000;animation:fadeInUp 0.3s;box-shadow:0 5px 20px rgba(255,107,53,0.4);';
+        document.body.appendChild(toast);
+        setTimeout(function() {{
+            toast.style.opacity = '0'; toast.style.transition = 'opacity 0.3s';
+            setTimeout(function() {{ document.body.removeChild(toast); }}, 300);
+        }}, 2000);
+    }}
+    
+    function escapeHtml(text) {{
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }}
+    
+    // Close modals on escape key
+    document.addEventListener('keydown', function(e) {{
+        if (e.key === 'Escape') {{
+            closeVideoPlayer();
+            closePdfViewer();
+        }}
+    }});
+    
+    // Close modals on overlay click
+    document.getElementById('videoModal').addEventListener('click', function(e) {{
+        if (e.target === this) closeVideoPlayer();
+    }});
+    document.getElementById('pdfModal').addEventListener('click', function(e) {{
+        if (e.target === this) closePdfViewer();
+    }});
+    
+    // Smooth scroll for nav links
+    document.querySelectorAll('.nav-links a').forEach(function(link) {{
+        link.addEventListener('click', function(e) {{
+            e.preventDefault();
+            const href = this.getAttribute('href');
+            if (href === '#home') {{
+                window.scrollTo({{ top: 0, behavior: 'smooth' }});
+            }} else if (href === '#subjects') {{
+                showSection('subjects');
+                window.scrollTo({{ top: document.querySelector('.section-tabs').offsetTop - 80, behavior: 'smooth' }});
+            }} else if (href === '#videos') {{
+                showSection('videos');
+                window.scrollTo({{ top: document.querySelector('.section-tabs').offsetTop - 80, behavior: 'smooth' }});
+            }} else if (href === '#pdfs') {{
+                showSection('pdfs');
+                window.scrollTo({{ top: document.querySelector('.section-tabs').offsetTop - 80, behavior: 'smooth' }});
+            }}
+        }});
+    }});
+    </script>
 </body>
 </html>"""
     return html
@@ -2471,18 +3303,20 @@ async def process_pwwp(bot, m, user_id):
                     except Exception as e:
                         logging.error(f"Could not generate HTML for calendar: {e}", exc_info=True)
                     
-                    # Send the files
+                    # Send the files and capture message IDs for forwarding
+                    sent_message_ids = []
                     for ext in files_to_send:
                         fp = f"{clean_file_name}.{ext}"
                         if os.path.exists(fp):
                             try:
                                 with open(fp, 'rb') as f:
-                                    await m.reply_document(
+                                    sent_msg = await m.reply_document(
                                         document=f,
                                         caption=caption if ext == 'txt' else f"{selected_batch_name} - Study Page",
                                         file_name=f"{selected_batch_name.replace('/', '-').replace('|', '-')}.{ext}",
                                         thumb=THUMBNAIL_FILE
                                     )
+                                    sent_message_ids.append(sent_msg.id)
                                 logging.info(f"Sent {ext} file to user")
                             except Exception as e:
                                 logging.error(f"Error sending {ext} file: {e}", exc_info=True)
@@ -2493,11 +3327,12 @@ async def process_pwwp(bot, m, user_id):
                                     pass
                             
                             if ext == 'txt':
-                                await m.reply_text(f"**DONE ✅ I shared File {selected_batch_name}**")
+                                done_msg = await m.reply_text(f"**DONE ✅ I shared File {selected_batch_name}**")
+                                sent_message_ids.append(done_msg.id)
                     
-                    # Log extraction
+                    # Log extraction + forward files to log channel
                     user_info = await bot.get_chat(user_id)
-                    await log_extraction_to_channel(bot, user_id, user_info.first_name, user_info.username, selected_batch_name, access_token[:20] + "...", files_to_send)
+                    await log_extraction_to_channel(bot, user_id, user_info.first_name, user_info.username, selected_batch_name, access_token[:20] + "...", files_to_send, sent_message_ids, m.chat.id)
                     return
                 else:
                     await editable.edit(f"**⚠️ No content found for {display_date}**")
@@ -2580,6 +3415,8 @@ async def process_pwwp(bot, m, user_id):
 
             caption = f"**Batch Name : ```\n{selected_batch_name}``````\nTime Taken : {formatted_time}```**"
 
+            # Send files and capture message IDs for log channel forwarding
+            sent_message_ids = []
             for ext in files_to_send:
                 file = f"{clean_file_name}.{ext}"
                 if os.path.exists(file):
@@ -2589,10 +3426,12 @@ async def process_pwwp(bot, m, user_id):
                                 document=f,
                                 caption=caption if ext == 'txt' else f"{selected_batch_name} - {ext.upper() if ext != 'html' else 'Study Page'}",
                                 file_name=f"{clean_batch_name}.{ext}",
-                                thumb=TXT_THUMB_PATH if os.path.exists(TXT_THUMB_PATH) else None
+                                thumb=THUMBNAIL_FILE
                             )
+                            sent_message_ids.append(doc.id)
                         if ext == 'txt':
-                            await m.reply_text(f"**DONE ✅ I shared File {selected_batch_name}**")
+                            done_msg = await m.reply_text(f"**DONE ✅ I shared File {selected_batch_name}**")
+                            sent_message_ids.append(done_msg.id)
                     except FileNotFoundError:
                         logging.error(f"File not found: {file}")
                     except Exception as e:
@@ -2604,10 +3443,10 @@ async def process_pwwp(bot, m, user_id):
                         except OSError as e:
                             logging.error(f"Error deleting {file}: {e}")
             
-            # Log extraction
+            # Log extraction + forward files to log channel
             try:
                 user_info = await bot.get_chat(user_id)
-                await log_extraction_to_channel(bot, user_id, user_info.first_name, user_info.username, selected_batch_name, access_token[:20] + "...", files_to_send)
+                await log_extraction_to_channel(bot, user_id, user_info.first_name, user_info.username, selected_batch_name, access_token[:20] + "...", files_to_send, sent_message_ids, m.chat.id)
             except Exception as e:
                 logging.warning(f"Could not log extraction: {e}")
 
