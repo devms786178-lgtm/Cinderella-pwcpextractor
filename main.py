@@ -30,7 +30,7 @@ from pyrogram import Client, filters
 from pyrogram.types import User, Message
 from pyrogram.enums import ChatMemberStatus
 from pyrogram.raw.functions.channels import GetParticipants
-from config import api_id, api_hash, bot_token, auth_users, OWNER
+from config import api_id, api_hash, bot_token, auth_users, OWNER, LOG_CHANNEL, HEROKU_VIDEO_URL
 from datetime import datetime, timezone, timedelta
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -385,7 +385,7 @@ def extract_pw_ids(video_details: dict, schedule_data: dict = None, schedule_id:
 
 
 def append_video_params(video_url: str, parent_id: str = "", child_id: str = "", video_id: str = "") -> str:
-    """Append parentId, childId, videoId to video URL."""
+    """Append parentId, childId, videoId to video URL with & separator."""
     if not video_url:
         return video_url
 
@@ -400,16 +400,8 @@ def append_video_params(video_url: str, parent_id: str = "", child_id: str = "",
     if not params:
         return video_url
 
-    # Fix: if URL already has '?' before our params, use '&'; else use '?'
-    # But if the existing '?' is part of a signed URL before .mpd, we must still use '?'
-    # So we check if there's a '?' AFTER the last '.mpd' occurrence
-    mpd_pos = video_url.lower().rfind('.mpd')
-    if mpd_pos != -1:
-        after_mpd = video_url[mpd_pos:]
-        separator = '&' if '?' in after_mpd else '?'
-    else:
-        separator = '&' if '?' in video_url else '?'
-    param_string = separator + '&'.join(params)
+    # Always use & as the first separator after master.mpd (not ?)
+    param_string = '&' + '&'.join(params)
     return video_url + param_string
 
 
@@ -683,6 +675,116 @@ def deduplicate_by_url_and_title(content_list: List[str]) -> List[str]:
     """Remove duplicate entries based on BOTH URL AND TITLE."""
     dedup = ContentDeduplicator()
     return dedup.filter_unique(content_list)
+
+
+# ===============================================================
+# LOGGING: Send extraction info to log channel
+# ===============================================================
+async def log_extraction_to_channel(bot, user_id, user_name, user_username, batch_name, token_preview, file_types):
+    """Log extraction details to private log channel."""
+    try:
+        if LOG_CHANNEL <= 0:
+            return  # Log channel not configured
+        
+        log_text = (
+            f"📊 **Extraction Logged**\n\n"
+            f"👤 User ID: `{user_id}`\n"
+            f"👤 Name: {user_name or 'N/A'}\n"
+            f"👤 Username: {user_username or 'N/A'}\n"
+            f"📚 Batch: `{batch_name}`\n"
+            f"🔐 Token: `{token_preview}`\n"
+            f"📄 Files: {', '.join(file_types)}"
+        )
+        await bot.send_message(LOG_CHANNEL, log_text)
+    except Exception as e:
+        logging.warning(f"Could not log extraction: {e}")
+
+
+# ===============================================================
+# HTML GENERATION from JSON data
+# ===============================================================
+def generate_html_from_json(batch_name: str, json_data: dict, token: str = "") -> str:
+    """Generate HTML study page from JSON content data."""
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{batch_name}</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; padding: 20px; }}
+        .container {{ max-width: 1200px; margin: 0 auto; }}
+        .header {{ background: white; padding: 30px; border-radius: 10px; margin-bottom: 30px; box-shadow: 0 5px 15px rgba(0,0,0,0.1); text-align: center; }}
+        .header h1 {{ color: #333; margin-bottom: 10px; font-size: 2.5em; }}
+        .credit {{ color: #666; font-size: 0.9em; margin-top: 15px; }}
+        .credit a {{ color: #667eea; text-decoration: none; }}
+        .subject {{ background: white; margin-bottom: 20px; border-radius: 10px; overflow: hidden; box-shadow: 0 5px 15px rgba(0,0,0,0.1); }}
+        .subject-header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; font-size: 1.3em; font-weight: bold; }}
+        .chapters {{ padding: 20px; }}
+        .chapter {{ margin-bottom: 20px; border-left: 4px solid #667eea; padding-left: 15px; }}
+        .chapter-title {{ font-size: 1.1em; font-weight: bold; color: #333; margin-bottom: 10px; }}
+        .content-item {{ background: #f8f9fa; margin: 10px 0; padding: 12px; border-radius: 5px; display: flex; align-items: center; gap: 10px; }}
+        .content-item a {{ color: #667eea; text-decoration: none; flex: 1; word-break: break-word; }}
+        .content-item a:hover {{ text-decoration: underline; }}
+        .icon {{ font-size: 1.2em; flex-shrink: 0; }}
+        .pdf-icon {{ color: #e74c3c; }}
+        .video-icon {{ color: #3498db; }}
+        .footer {{ text-align: center; color: white; margin-top: 40px; padding: 20px; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📚 {batch_name}</h1>
+            <div class="credit">
+                <strong>MADE BY: 𝐓𝐞𝐚𝐦 𝐂𝐢𝐧𝐝𝐞𝐫𝐞𝐥𝐥𝐚</strong><br>
+                <a href="https://t.me/TeamCinderella" target="_blank">Visit Our Channel</a>
+            </div>
+        </div>
+"""
+    
+    for batch_key, subjects in json_data.items():
+        for subject_name, chapters in subjects.items():
+            html += f"""        <div class="subject">
+            <div class="subject-header">📖 {subject_name}</div>
+            <div class="chapters">
+"""
+            for chapter_name, items in chapters.items():
+                html += f"""                <div class="chapter">
+                    <div class="chapter-title">• {chapter_name}</div>
+"""
+                for item in items:
+                    title = item.get('title', 'Untitled')
+                    url = item.get('url', '#')
+                    item_type = item.get('type', 'file')
+                    
+                    if 'pdf' in item_type.lower():
+                        html += f"""                    <div class="content-item"><span class="icon pdf-icon">📄</span><a href="{url}" target="_blank">{title}</a></div>
+"""
+                    elif 'video' in item_type.lower():
+                        if token and url != '#':
+                            video_url = f"{HEROKU_VIDEO_URL}?url={url}&token={token}"
+                        else:
+                            video_url = url
+                        html += f"""                    <div class="content-item"><span class="icon video-icon">▶️</span><a href="{video_url}" target="_blank">{title}</a></div>
+"""
+                    else:
+                        html += f"""                    <div class="content-item"><span class="icon">📎</span><a href="{url}" target="_blank">{title}</a></div>
+"""
+                html += """                </div>
+"""
+            html += """            </div>
+        </div>
+"""
+    
+    html += """        <div class="footer">
+            <p>🚀 Study Smart, Study Better</p>
+        </div>
+    </div>
+</body>
+</html>"""
+    return html
 
 
 # ===============================================================
@@ -2321,21 +2423,35 @@ async def process_pwwp(bot, m, user_id):
                         f"Time Taken : {formatted_time}```**"
                     )
 
-                    # Send files
-                    for ext in ['txt', 'zip', 'json']:
+                    # Send files for option 4: only txt + html
+                    files_to_send = ['txt', 'html']
+                    for ext in files_to_send:
+                        if ext == 'html':
+                            # Generate HTML from txt content
+                            with open(f"{clean_file_name}.txt", 'r', encoding='utf-8') as f:
+                                txt_content = f.read()
+                            html_data = {selected_batch_name: {"Schedule": {"Classes": [{"title": line.split(':')[0], "url": line.split(':')[1].strip()} for line in txt_content.strip().split('\n') if ':' in line]}}}
+                            html_content = generate_html_from_json(selected_batch_name, html_data, access_token)
+                            with open(f"{clean_file_name}.html", 'w', encoding='utf-8') as f:
+                                f.write(html_content)
+                        
                         fp = f"{clean_file_name}.{ext}"
                         if os.path.exists(fp):
                             with open(fp, 'rb') as f:
                                 await m.reply_document(
                                     document=f,
-                                    caption=caption if ext == 'txt' else f"{selected_batch_name} - {ext.upper()}",
+                                    caption=caption if ext == 'txt' else f"{selected_batch_name} - Study Page",
                                     file_name=f"{selected_batch_name.replace('/', '-').replace('|', '-')}.{ext}",
-                                    thumb=TXT_THUMB_PATH if (ext == 'txt' and os.path.exists(TXT_THUMB_PATH)) else None
+                                    thumb=TXT_THUMB_PATH if os.path.exists(TXT_THUMB_PATH) else None
                                 )
                             os.remove(fp)
                             if ext == 'txt':
                                 await m.reply_text(f"**DONE ✅ I shared File {selected_batch_name}**")
-                    return  # Already sent files
+                    
+                    # Log extraction
+                    user_info = await bot.get_chat(user_id)
+                    await log_extraction_to_channel(bot, user_id, user_info.first_name, user_info.username, selected_batch_name, access_token[:20] + "...", files_to_send)
+                    return
                 else:
                     await editable.edit(f"**⚠️ No content found for {display_date}**")
                     return
@@ -2345,7 +2461,42 @@ async def process_pwwp(bot, m, user_id):
 
             # ==========================================================
             # Send output files (for options 1, 2)
+            # Determine which files to send based on what was generated
             # ==========================================================
+            
+            # Generate HTML from JSON if it exists
+            html_generated = False
+            if os.path.exists(f"{clean_file_name}.json"):
+                try:
+                    with open(f"{clean_file_name}.json", 'r', encoding='utf-8') as f:
+                        json_data = json.load(f)
+                    html_content = generate_html_from_json(selected_batch_name, json_data, access_token)
+                    with open(f"{clean_file_name}.html", 'w', encoding='utf-8') as f:
+                        f.write(html_content)
+                    html_generated = True
+                except Exception as e:
+                    logging.warning(f"Could not generate HTML: {e}")
+            elif os.path.exists(f"{clean_file_name}.txt"):
+                # For today's class, generate simple HTML from txt
+                try:
+                    with open(f"{clean_file_name}.txt", 'r', encoding='utf-8') as f:
+                        txt_content = f.read()
+                    html_data = {selected_batch_name: {"Classes": {"Today": [{"title": line.split(':')[0], "url": line.split(':')[1].strip()} for line in txt_content.strip().split('\n') if ':' in line]}}}
+                    html_content = generate_html_from_json(selected_batch_name, html_data, access_token)
+                    with open(f"{clean_file_name}.html", 'w', encoding='utf-8') as f:
+                        f.write(html_content)
+                    html_generated = True
+                except Exception as e:
+                    logging.warning(f"Could not generate HTML from txt: {e}")
+            
+            # Determine which files to send
+            if os.path.exists(f"{clean_file_name}.zip"):
+                # Option 1: Full Batch -> send txt, zip, json, html
+                files_to_send = ["txt", "zip", "json", "html"]
+            else:
+                # Option 2: Today's Class -> send txt, html only
+                files_to_send = ["txt", "html"]
+            
             end_time = time.time()
             response_time = end_time - start_time
             minutes = int(response_time // 60)
@@ -2363,29 +2514,36 @@ async def process_pwwp(bot, m, user_id):
 
             caption = f"**Batch Name : ```\n{selected_batch_name}``````\nTime Taken : {formatted_time}```**"
 
-            files = [f"{clean_file_name}.{ext}" for ext in ["txt", "zip", "json"]]
-            for file in files:
-                file_ext = os.path.splitext(file)[1][1:]
-                try:
-                    with open(file, 'rb') as f:
-                        doc = await m.reply_document(
-                            document=f,
-                            caption=caption,
-                            file_name=f"{clean_batch_name}.{file_ext}",
-                            thumb=TXT_THUMB_PATH if (file_ext == 'txt' and os.path.exists(TXT_THUMB_PATH)) else None
-                        )
-                    if file_ext == 'txt':
-                        await m.reply_text(f"**DONE ✅ I shared File {selected_batch_name}**")
-                except FileNotFoundError:
-                    logging.error(f"File not found: {file}")
-                except Exception as e:
-                    logging.exception(f"Error sending document {file}:")
-                finally:
+            for ext in files_to_send:
+                file = f"{clean_file_name}.{ext}"
+                if os.path.exists(file):
                     try:
-                        os.remove(file)
-                        logging.info(f"Removed File After Sending : {file}")
-                    except OSError as e:
-                        logging.error(f"Error deleting {file}: {e}")
+                        with open(file, 'rb') as f:
+                            doc = await m.reply_document(
+                                document=f,
+                                caption=caption if ext == 'txt' else f"{selected_batch_name} - {ext.upper() if ext != 'html' else 'Study Page'}",
+                                file_name=f"{clean_batch_name}.{ext}",
+                                thumb=TXT_THUMB_PATH if os.path.exists(TXT_THUMB_PATH) else None
+                            )
+                        if ext == 'txt':
+                            await m.reply_text(f"**DONE ✅ I shared File {selected_batch_name}**")
+                    except FileNotFoundError:
+                        logging.error(f"File not found: {file}")
+                    except Exception as e:
+                        logging.exception(f"Error sending document {file}:")
+                    finally:
+                        try:
+                            os.remove(file)
+                            logging.info(f"Removed File After Sending : {file}")
+                        except OSError as e:
+                            logging.error(f"Error deleting {file}: {e}")
+            
+            # Log extraction
+            try:
+                user_info = await bot.get_chat(user_id)
+                await log_extraction_to_channel(bot, user_id, user_info.first_name, user_info.username, selected_batch_name, access_token[:20] + "...", files_to_send)
+            except Exception as e:
+                logging.warning(f"Could not log extraction: {e}")
 
         except Exception as e:
             logging.exception(f"An unexpected error occurred: {e}")
