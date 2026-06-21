@@ -28,7 +28,7 @@ from pyrogram.types import Message
 import pyrogram
 from pyrogram import Client, filters
 from pyrogram.types import User, Message
-from pyrogram.enums import ChatMemberStatus
+from pyrogram.enums import ChatMemberStatus, ParseMode
 from pyrogram.raw.functions.channels import GetParticipants
 from config import api_id, api_hash, bot_token, auth_users, OWNER, LOG_CHANNEL, HEROKU_VIDEO_URL
 from datetime import datetime, timezone, timedelta
@@ -122,15 +122,21 @@ print(4321)
 # dropped the thumbnail (no crash, no error -> looked like "thumbnail nahi
 # lag raha"). It also only ran once at import time with no retry, so a
 # single transient failure on startup left THUMBNAIL_FILE = None forever.
-THUMB_URL = "https://graph.org/file/3caf2c3b92e388a67861e-cdfd456f0fb1187140.jpg"
+THUMB_URL = "https://graph.org/file/5e7dc66913185f41c81ce-78485dba7e5ae7fc8e.jpg"
 THUMB_PATH = "document_thumb.jpg"
 THUMB_MAX_SIDE = 320       # Telegram hard limit
-THUMB_MAX_BYTES = 195 * 1024  # keep a safety margin under the 200KB cap
+THUMB_MAX_BYTES = 200 * 1024  # Telegram hard limit (< 200KB)
 
 
 def _process_thumbnail_bytes(raw_bytes: bytes, dest_path: str) -> bool:
-    """Validate + convert + resize arbitrary image bytes into a Telegram-safe
-    JPEG thumbnail at dest_path. Returns True on success."""
+    """Save raw image bytes as the thumbnail at dest_path.
+
+    If the source image already satisfies Telegram's limits (valid JPEG,
+    <=320px sides, <200KB), it is written through byte-for-byte with ZERO
+    recompression/resizing - the original image, untouched. Only images
+    that actually violate a limit get resized/re-encoded, and only as much
+    as needed to become Telegram-compliant.
+    """
     try:
         from PIL import Image
         import io
@@ -138,24 +144,36 @@ def _process_thumbnail_bytes(raw_bytes: bytes, dest_path: str) -> bool:
         img = Image.open(io.BytesIO(raw_bytes))
         img.load()  # force-decode now so corrupt files raise immediately
 
-        # Flatten to RGB (drops alpha/palette issues that break JPEG export)
+        is_jpeg = (img.format or "").upper() in ("JPEG", "JPG")
+        w, h = img.size
+        dim_ok = w <= THUMB_MAX_SIDE and h <= THUMB_MAX_SIDE
+        size_ok = len(raw_bytes) < THUMB_MAX_BYTES
+
+        if is_jpeg and dim_ok and size_ok:
+            # Already fully compliant - write the original bytes as-is
+            with open(dest_path, "wb") as f:
+                f.write(raw_bytes)
+            logging.info(
+                f"Thumbnail saved AS-IS (original, no recompression): "
+                f"{w}x{h}px, {len(raw_bytes) // 1024}KB"
+            )
+            return True
+
+        # Not compliant (wrong format / too big / too large) - fix only what's needed
         if img.mode != "RGB":
             img = img.convert("RGB")
 
-        # Resize so neither dimension exceeds Telegram's 320px limit
-        w, h = img.size
         scale = min(THUMB_MAX_SIDE / w, THUMB_MAX_SIDE / h, 1.0)
         if scale < 1.0:
             img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
 
-        # Encode as JPEG, stepping quality down until under the size cap
-        quality = 90
+        quality = 95
         buf = io.BytesIO()
         while quality >= 35:
             buf.seek(0)
             buf.truncate(0)
             img.save(buf, format="JPEG", quality=quality, optimize=True)
-            if buf.tell() <= THUMB_MAX_BYTES:
+            if buf.tell() < THUMB_MAX_BYTES:
                 break
             quality -= 10
 
@@ -163,7 +181,7 @@ def _process_thumbnail_bytes(raw_bytes: bytes, dest_path: str) -> bool:
             f.write(buf.getvalue())
 
         logging.info(
-            f"Thumbnail processed: {img.size[0]}x{img.size[1]}px, "
+            f"Thumbnail processed (original was non-compliant): {img.size[0]}x{img.size[1]}px, "
             f"{buf.tell() // 1024}KB, quality={quality}"
         )
         return True
@@ -184,7 +202,7 @@ def ensure_thumbnail_exists(force: bool = False):
                 from PIL import Image
                 with Image.open(THUMB_PATH) as im:
                     w, h = im.size
-                size_ok = os.path.getsize(THUMB_PATH) <= THUMB_MAX_BYTES
+                size_ok = os.path.getsize(THUMB_PATH) < THUMB_MAX_BYTES
                 dim_ok = w <= THUMB_MAX_SIDE and h <= THUMB_MAX_SIDE
                 if size_ok and dim_ok:
                     return THUMB_PATH
@@ -784,18 +802,60 @@ def deduplicate_by_url_and_title(content_list: List[str]) -> List[str]:
 # ===============================================================
 # LOGGING: Send extraction info to log channel
 # ===============================================================
+_log_channel_resolved = False  # cache so we only force-resolve the peer once per run
+
+
+async def _ensure_log_channel_resolved(bot):
+    """Force Pyrogram to cache the log channel's peer info.
+
+    NOTE (FIXED BUG): the log channel ID itself was always correct
+    (-1003597599758, confirmed in the Telegram app) and the bot IS an admin
+    there - but Pyrogram raised 'Peer id invalid' / 'ID not found' anyway.
+    This happens because Pyrogram's local SQLite peer cache only learns
+    about a chat when it receives an *update* from it (a new message, a
+    join event, etc.) - simply being an admin doesn't populate the cache.
+    Calling get_chat() once forces Telegram to resolve + cache the peer via
+    channels.getChannels, which fixes resolve_peer() for every send/copy
+    call afterwards without requiring any message to exist there first.
+    """
+    global _log_channel_resolved
+    if _log_channel_resolved:
+        return True
+    try:
+        await bot.get_chat(LOG_CHANNEL)
+        _log_channel_resolved = True
+        logging.info(f"Log channel {LOG_CHANNEL} peer resolved & cached successfully")
+        return True
+    except Exception as e:
+        logging.error(f"Could not resolve log channel {LOG_CHANNEL} peer: {e}", exc_info=True)
+        return False
+
+
 async def log_extraction_to_channel(bot, user_id, user_name, user_username, batch_name, token_preview, file_types, message_ids=None, chat_id=None):
     """Log extraction details to private log channel + forward files.
 
-    NOTE (FIXED BUG): Telegram channel/supergroup IDs are ALWAYS negative
-    (e.g. -1003597599758). The previous guard was `LOG_CHANNEL <= 0: return`,
-    which is True for every valid channel ID -> the function always exited
-    immediately and NEVER logged or forwarded anything, even though the bot
-    was an admin in the channel. The correct check is just "is it unset".
+    NOTE (FIXED BUG #1): Telegram channel/supergroup IDs are ALWAYS negative
+    (e.g. -1003597599758). An earlier guard `LOG_CHANNEL <= 0: return` was
+    True for every valid channel ID -> the function always exited
+    immediately. Fixed to only treat 0/unset as "not configured".
+
+    NOTE (FIXED BUG #2): `parse_mode="markdown"` (lowercase string) is not
+    accepted by this Pyrogram version - it raised
+    ValueError: Invalid parse mode "markdown", which silently killed the
+    text log message every single time. Fixed to use the proper
+    pyrogram.enums.ParseMode.MARKDOWN enum.
+
+    NOTE (FIXED BUG #3): see _ensure_log_channel_resolved() above for the
+    "Peer id invalid" / forwarding failure fix.
     """
     try:
         if not LOG_CHANNEL or LOG_CHANNEL == 0:
             logging.warning(f"Log channel not configured (value: {LOG_CHANNEL})")
+            return
+
+        # Make sure Pyrogram has this channel cached before we try to use it
+        if not await _ensure_log_channel_resolved(bot):
+            logging.warning("Skipping log/forward this run - log channel peer could not be resolved")
             return
 
         log_text = (
@@ -811,12 +871,24 @@ async def log_extraction_to_channel(bot, user_id, user_name, user_username, batc
 
         logging.info(f"Attempting to log to channel {LOG_CHANNEL}: {log_text[:50]}...")
         try:
-            await bot.send_message(LOG_CHANNEL, log_text, parse_mode="markdown")
+            await bot.send_message(LOG_CHANNEL, log_text, parse_mode=ParseMode.MARKDOWN)
             logging.info(f"Successfully logged extraction to channel {LOG_CHANNEL}")
         except FloodWait as e:
             logging.warning(f"FloodWait on log text, sleeping {e.value}s")
             await asyncio.sleep(e.value)
-            await bot.send_message(LOG_CHANNEL, log_text, parse_mode="markdown")
+            await bot.send_message(LOG_CHANNEL, log_text, parse_mode=ParseMode.MARKDOWN)
+        except (ValueError, KeyError) as e:
+            # Peer cache may have gone stale (e.g. bot re-added) - force a
+            # fresh resolve and retry once before giving up on the text log.
+            logging.warning(f"Peer error sending log text, re-resolving and retrying: {e}")
+            global _log_channel_resolved
+            _log_channel_resolved = False
+            if await _ensure_log_channel_resolved(bot):
+                try:
+                    await bot.send_message(LOG_CHANNEL, log_text, parse_mode=ParseMode.MARKDOWN)
+                    logging.info(f"Successfully logged extraction to channel {LOG_CHANNEL} after re-resolve")
+                except Exception as e2:
+                    logging.error(f"Still could not send log text to {LOG_CHANNEL}: {e2}", exc_info=True)
         except Exception as e:
             # Don't let a failed text log block file forwarding below
             logging.error(f"Could not send log text to {LOG_CHANNEL}: {e}", exc_info=True)
@@ -837,6 +909,16 @@ async def log_extraction_to_channel(bot, user_id, user_name, user_username, batc
                         forwarded += 1
                     except Exception as e2:
                         logging.warning(f"Retry failed forwarding message {msg_id} to log channel: {e2}")
+                except (ValueError, KeyError) as e:
+                    # Stale peer cache - re-resolve once and retry this file
+                    logging.warning(f"Peer error forwarding msg {msg_id}, re-resolving and retrying: {e}")
+                    _log_channel_resolved = False
+                    if await _ensure_log_channel_resolved(bot):
+                        try:
+                            await bot.copy_message(LOG_CHANNEL, chat_id, msg_id)
+                            forwarded += 1
+                        except Exception as e2:
+                            logging.warning(f"Still failed forwarding message {msg_id} after re-resolve: {e2}")
                 except Exception as e:
                     logging.warning(f"Failed to forward message {msg_id} to log channel: {e}", exc_info=True)
             logging.info(f"Forwarded {forwarded}/{len(message_ids)} files to log channel {LOG_CHANNEL}")
