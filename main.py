@@ -3553,7 +3553,7 @@ async def process_pwwp(bot, m, user_id):
                     with open(f"{clean_file_name}.txt", "w", encoding="utf-8") as f:
                         f.writelines(today_schedule)
                 else:
-                    raise Exception("No Classes Found Today")
+                    raise Exception("No classes found for today.\n\nSo Revise today and prepare for tomorrow😊.")
 
             # ==========================================================
             # OPTION 4: SELECT DATE (DD/MM/YYYY INPUT)
