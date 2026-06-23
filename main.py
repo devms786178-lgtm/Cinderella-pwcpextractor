@@ -1,5 +1,5 @@
 import requests
-import pillow
+import Pillow
 import asyncio
 import aiohttp
 import json
